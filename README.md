@@ -1,112 +1,64 @@
-# 手表 DSH
+# AA 手表（Agents Anywhere 手表版）
 
-在智能手表上查看和操作电脑上的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 会话。
-
-电脑上跑着 DSH，手表连上它，就能随时掏出手腕看 AI 干到哪一步了：
+在智能手表上直接使用 [Agents Anywhere](https://agents-anywhere.com)：用你的 AA 账号登录，手表上就能看到与手机客户端同一个世界的会话、提问与模型。
 
 - 按**项目**浏览全部会话，点进去看对话正文
 - 展开**工具调用**，看每一步读了什么文件、执行了什么命令、返回了什么结果
 - **发消息**、停止生成、往前翻历史
-- 回答 AI 的提问（单选、多选、打字都支持）
-- 切换**模型**与推理强度，查看 **token 用量**与上下文占用
+- 回答 AI 的提问与审批请求（单选、多选、打字都支持）
+- 切换**模型**与推理强度
+- 多账号：云端、自托管服务器、不同邮箱，都记在「设置」里一键切换
 
-不需要公网服务器，不需要改动 DSH 的任何配置，也不依赖任何 DSH 插件。
-
-> 开发环境为 OPPO Watch（Android 11，466×466 圆屏）。应用最低支持 Android 8.0，其它 Wear OS / Android 手表理论可用，但界面是按圆屏设计的。
+> 本分支由 [dsh-watch](https://github.com/DING-HAO-RAN/dsh-watch)（DSH 手表版）改造而来：手表不再经过局域网中继，而是作为 AA 服务的客户端直连。仓库里的 `desktop/` 与 `relay/` 是原方案的遗留代码，仅作参考，不再参与构建。
 
 ## 工作原理
 
 ```
-┌─────────────┐        HTTP/JSON         ┌──────────────┐       DSH 协议        ┌─────────┐
-│  手表端应用  │ ───────────────────────▶ │   中继服务    │ ───────────────────▶ │   DSH   │
-│ (Android)   │ ◀─────────────────────── │ (电脑上运行)  │ ◀─────────────────── │ 桌面版  │
-└─────────────┘   只有 10 个简单接口     └──────────────┘   签名 cookie + 裁剪  └─────────┘
-                          ▲                      │
-                          └── UDP 广播自动发现 ───┘
+┌─────────────┐     HTTPS / REST        ┌──────────────────────────┐
+│  手表端应用  │ ──────────────────────▶ │  Agents Anywhere 服务     │
+│ (Android)   │ ◀────────────────────── │  云端或自托管，手机客户端   │
+└─────────────┘   登录 + 会话 + 通知     │  连接器跑在你的电脑上      │
+                                        └──────────────────────────┘
 ```
 
-**为什么不能直连 DSH？** 两个硬障碍：
+手表与 AA 的安卓手机客户端走同一组 REST 接口：`/api/v2/auth/*` 登录换取令牌，`/api/v2/projects`、`/sessions`、`/timeline` 拉数据，`/runtime/*` 发消息、停止生成、回答提问。数据直达会话本体，不经过任何中间层。
 
-1. DSH 的 `/api` 只接受它自己签发的、绑定到自身地址的签名 cookie，手表无法自行鉴权；
-2. 一次会话的原始响应有几百 KB（含大量流式分片与工具 diff），手表既收不下也没必要收。
+**为什么直连云端而不是连电脑？** 电脑上的 DSH 桥只监听 `127.0.0.1`，手表本来就够不着；而走 AA 云端正是官方手机客户端的路径——账号在网页和手机上已经用一套，手表上登录同一个账号即可，无需在电脑上额外开服务、开端口、配防火墙。HTTP 层封装集中在 [Api.java](app/src/main/java/cn/dsh/watch/Api.java) 一个文件里，想换成自托管服务器只需改登录页里的地址。
 
-中继把这两件事都吸收掉：它从本机 DSH 的凭据里推导出一张合法票据完成鉴权，再把数据裁剪成手表真正要用的部分，对外只暴露一组简单的 REST 接口。**它只读凭据，不改配置、不装插件。**
+## 从源码构建
 
-## 下载与安装
-
-### 1. 电脑端（二选一）
-
-**方式 A：桌面程序（推荐）**
-
-到 [Releases](https://github.com/DING-HAO-RAN/dsh-watch/releases/latest) 下载 `DSH-Relay.exe`，双击即可。也可以直接点：
-
-```
-https://github.com/DING-HAO-RAN/dsh-watch/releases/latest/download/DSH-Relay.exe
-```
-
-这是主推形态：一个文件，拷到任何 Windows 10/11 上都能跑，**目标电脑不需要装 .NET、Node.js 或任何其它东西**。程序会自动找到本机正在运行的 DSH，并在窗口里显示配对码和地址。
-
-**方式 B：命令行中继（需装 Node.js）**
-
-不需要界面、或要在服务器上跑时，直接用源码运行：
+需要 **JDK 17+** 与 **Android SDK platform-35 + build-tools**。
 
 ```powershell
-node relay/src/server.mjs            # 只开局域网
-node relay/src/server.mjs --tunnel   # 同时开一条公网地址
+$env:JAVA_HOME        = "C:\path\to\jdk"        # JDK 17 或更高
+$env:ANDROID_HOME     = "C:\path\to\android-sdk"
+pwsh -File scripts/build.ps1 -BuildRoot "D:\build\dsh-watch-aa"
 ```
 
-常用参数：`--port 19390`（手表接入端口）、`--dsh-port 19387`（本机 DSH 端口）、`--state-file <文件>`（配对令牌存档位置）。
+产出 `dist/AA手表.apk`。构建过程直接调用 SDK 工具链（aapt2 → javac → d8 → zipalign → apksigner），不依赖 Gradle。`BuildRoot` 必须在项目目录之外（脚本会拒绝在工作树里构建，避免把临时产物和私钥混进版本库）。签名密钥首次构建时自动生成，**请保留同一个密钥**以便覆盖安装。
 
-也可以用 `scripts/pack-relay.ps1` 把它打包成单个 exe（内含 Node 运行时），见[从源码构建](#命令行中继)。
-
-两种方式都要求电脑上**已安装并正在运行 DSH 桌面版**（中继需要读取它的登录凭据）。
-
-> **公网访问是可选的附加功能**，需要 `cloudflared`。它不随 Releases 提供（体积约 50 MB），把 `cloudflared.exe` 放到程序（或中继）所在目录即可启用；缺了它只影响公网访问，局域网照常可用。
-
-### 2. 手表端
-
-到 [Releases](https://github.com/DING-HAO-RAN/dsh-watch/releases/latest) 下载 `DSH-Watch.apk`（直接下载地址：`https://github.com/DING-HAO-RAN/dsh-watch/releases/latest/download/DSH-Watch.apk`），然后：
+## 安装与登录
 
 1. 手表开启「开发者选项」与「USB 调试」（通常在「关于手表」里连点版本号）；
-2. 用数据线连接电脑，在手表上允许调试授权；
-3. 确认设备已就绪：
+2. 数据线连接电脑，手表上允许调试授权；
+3. 安装：
 
 ```powershell
-adb devices    # 状态应为 device，而不是 unauthorized
+adb install -r "dist/AA手表.apk"
 ```
 
-4. 安装：
+4. 打开应用，在「账号」页填**服务器地址**（默认 `https://web.agents-anywhere.com`）、**邮箱**与**密码**，点「登录」。
 
-```powershell
-adb install -r "DSH-Watch.apk"
-```
-
-也可以直接用启动参数预填地址与配对码，省去在手表上输入：
+手表上打字不便时，可以用 adb 把登录信息直接送进去（密码不落 shell 历史）：
 
 ```powershell
 adb shell am start -n cn.dsh.watch/.MainActivity `
-  --es host 192.168.1.100 --ei port 19390 --es code 123456 --ez autopair true
+  --es server https://web.agents-anywhere.com `
+  --es email you@example.com `
+  --es password "你的密码" --ez autologin true
 ```
 
-`autopair` 会在填好之后自动发起配对，连点一次都不用在手表上做。
-
-### 3. 配对
-
-有两种方式，推荐第一种。
-
-**一键配对（省事）**：手表上「设置」→ 点「一键配对」→ 手表自己找到同一 WiFi 下的电脑 → 电脑上弹出确认框，点「是」→ 地址与令牌自动导入。
-
-**手动填**：电脑端窗口里会显示 **6 位配对码**和**若干条地址**，在手表「设置」里：
-
-- **地址**：填窗口里显示的地址（同一个 WiFi 填「局域网」那条；也可以点「自动查找局域网」自动填入）
-- **配对码**：填窗口里的 6 位数字
-- 点「配对并连接」
-
-配对成功后手表会记住，之后打开直接就是会话列表。**配对码与令牌都会保存在电脑上**，中继重启、甚至升级程序都不会变，不用重配。需要换码时点窗口里的「换一个配对码」。
-
-### 4. 多台设备之间切换
-
-手表会记住每一台连过的设备（显示电脑名与地址）。在「设置」→「已记住的设备」里点一条就能直接切过去，不用重新配对。出门用公网、回家用局域网、换另一台电脑，都在这个列表里。
+「记住密码」开关默认开启：令牌有效期 7 天，过期后用手表上保存的密码静默重登，你几乎感觉不到。关掉它则每次过期都要手动登录。
 
 ## 日常使用
 
@@ -117,92 +69,27 @@ adb shell am start -n cn.dsh.watch/.MainActivity `
 | 看有哪些项目 | 打开应用即是项目列表；点项目看它下面的会话 |
 | 看对话 | 点会话卡片；进入时自动定位到最新内容 |
 | 看 AI 的思考 | 每条回复上方有「思考 ▸」，点开就是他得出这句话之前的推理 |
-| 看每一步操作 | 两段回复之间的工具调用会收成一组（显示「N 项」）；点一下列出清单，再点某一条看它的参数与结果 |
+| 看每一步操作 | 两段回复之间的工具调用会收成一组；点一下列出清单，再点某一条看参数与结果 |
 | 只想要纯对话 | 左滑 →「只看对话」 |
 | 发消息 | 会话页点「发消息」→ 输入 →「发送」 |
 | 停止生成 | 会话页点「停止」 |
-| 回答问题 | 有待答提问时会显示「AI 在等你回答」，点进去选选项 |
-| 换模型 | 左滑 →「模型」：先显示当前模型，再逐级选供应商 → 模型 → 推理强度 |
-| 看用量 | 左滑 →「用量」：token 消耗、上下文占用、耗时统计 |
+| 回答问题 / 审批 | 有待答通知时会显示「AI 在等你回答」，点进去选选项或打字 |
+| 新建会话 | 列表页点「新建会话」：先选项目，再输入第一条消息 |
+| 换模型 | 左滑 →「模型」：先显示当前模型，再选模型 → 推理强度 |
 | 往前翻历史 | 左滑 →「看更早的内容」 |
-| 换电脑 / 切设备 | 左滑 →「设置」：已记住的设备点一条就切过去 |
-| 连一台新电脑 | 设置页点「一键配对」，电脑上点「是」即可 |
-
-## 从源码构建
-
-### 手表应用
-
-需要 **JDK 17+**、**Android SDK platform-35** 与 **build-tools**。
-
-```powershell
-$env:JAVA_HOME            = "C:\path\to\jdk"        # JDK 17 或更高
-$env:ANDROID_HOME         = "C:\path\to\android-sdk"
-$env:WATCH_BUILD_ROOT     = "D:\build\watch-dsh"    # 必须在项目目录之外
-pwsh -File scripts/build.ps1 -WorkRoot .
-```
-
-产出 `dist/DSH手表.apk`。构建过程是直接用 SDK 工具链（aapt2 → javac → d8 → zipalign → apksigner），不依赖 Gradle。
-
-签名密钥首次构建时自动生成在 `$env:WATCH_BUILD_ROOT/signing/dsh-watch-dev.jks`（默认口令 `android-dev`）。**请保留同一个密钥**以便覆盖安装；正式分发请换成自己的密钥。
-
-`WATCH_BUILD_ROOT` 不在项目目录内是硬性要求，脚本会拒绝在工作树里构建——避免把临时产物和私钥混进版本库。
-
-### 桌面程序
-
-只需要 **Windows 自带的 .NET Framework 4.8 编译器**，不必安装 .NET SDK：
-
-```powershell
-pwsh -File scripts/build-app.ps1 -WorkRoot .
-```
-
-产出 `dist/DSH中继/`。首次构建会从 NuGet 取一次 WebView2 的托管程序集并缓存，之后离线可用。
-
-### 命令行中继
-
-需要 **Node.js 22+**：
-
-```powershell
-pwsh -File scripts/pack-relay.ps1 -WorkRoot .
-```
-
-产出 `dist/中继命令行版/`。它用 Node 的 SEA（Single Executable Application）把中继和 Node 运行时打进单个 exe，拷到没装 Node 的机器上也能跑。首次打包会联网获取一次 `postject` 并缓存。
-
-> 上述脚本用 PowerShell 7（`pwsh`）调用；Windows 自带的 Windows PowerShell 5.1 也能运行。
-
-## 测试
-
-中继提供了几个自检脚本，走的是手表实际调用的同一组接口，因此可以在电脑上替代大部分真机点击验证：
-
-```powershell
-node tests/check-protocol.mjs                 # 逐个核对 DSH 端点的参数形态（只读）
-node tests/check-features.mjs                 # 项目分组、步骤详情、模型目录、用量、翻页（只读）
-node tests/e2e.mjs --port 19390 --code 123456 # 端到端：配对、列表、读消息、发消息
-node tests/answer-once.mjs --pick 米饭         # 回答当前待答问题，并确认它从待答列表消失
-node tests/send.mjs --session <id> --text "内容"  # 从中继侧发一条消息
-```
-
-`e2e.mjs` 会真的往会话里发一条带时间戳的消息并确认它进入 DSH（发送用例会单独建一个空白会话，不污染现有对话）。
-
-以下几个用于排查问题：
-
-```powershell
-node tests/watch-events.mjs --seconds 15      # 观察 DSH 事件流（提问没冒出来时用）
-node tests/probe-shapes.mjs                   # 查看 DSH 实际返回的字段形状
-```
-
-涉及界面行为的改动，建议再用 `adb` 在真机上从实际入口走一遍（启动 → 点项目 → 点会话 → 发消息 / 答题）。
+| 换账号 | 左滑 →「设置」：已记住的账号点一条就切过去 |
+| 退出登录 | 设置页点「退出登录」（清除令牌，账号与密码保留） |
 
 ## 实现要点
 
-- **鉴权**：DSH 的 `/api` 只认它自己签发的 `dsh-auth-<hash>` cookie。中继从 `~/.dsh/.credentials.yaml` 读取签名密钥，按同一算法为 `127.0.0.1:<port>` 签一张票，因此无需改动 DSH 即可合法调用。有效期不得超过 DSH 的 `cookieMaxAgeDays`（默认 30 天）。
-- **自动找到 DSH**：桌面程序按「运行中的 DSH 进程位置 → 用户主目录 → 常见安装位置 → 其它盘符」的顺序查找 `.dsh` 配置目录，并探测几个常见端口，两样都对上才算可用。找不到时会明确说明原因（没装 / 没启动 / 读不出凭据）。
-- **提问有两条通道**：仍在等待（`open`）的问题只经 WebSocket `$events` 流下发，且**不带 callId**，必须用 `$events/result` 按 `eventId` 回填；已超时挂起（`continued`）的问题才走 `userQuestions/answer` RPC。中继按情况自动选路。
-- **补齐遗漏的提问**：DSH 会在新客户端接入事件流时重放所有待处理事件，中继据此在「有会话运行但看不到提问」时重连一次事件流来补齐。
-- **数据裁剪**：中继只保留真人消息、助手正文与工具步骤，把长文本截断后再给手表。会话事件里混有大量系统注入的 `user/message`（时间上下文、记忆快照、指令），只有 `source.kind` 为 `user` / `user-question-reply` 的才是真人消息。
-- **局域网发现**：中继每 2 秒向 UDP 19391 端口广播一条 JSON（`{service, port, name}`），手表收到即可自动填地址；广播不可靠时仍可手动输入。选择 UDP 广播而不是 mDNS，是为了让手表端不引入任何依赖。
-- **单文件分发**：桌面程序把 WebView2 的托管程序集与原生加载器都嵌进 exe——托管程序集在启动时**从内存装入**，原生加载器释放到程序目录。这样分发只需一个文件，也不会往用户配置目录里堆东西。
-- **圆屏适配**：按圆的内接矩形统一留边（左右 15%、上下 18%），四角到圆心约 0.474 < 半径 0.5，整个滚动区都在圆内，因此不需要为每个页面单独算边距。
-- **界面永远可用**：桌面程序有两层界面——内嵌浏览器的网页控制台（好看、信息密度高）和纯 WinForms 的原生界面（零依赖）。前者依赖 WebView2 运行时，精简版 Windows 上可能没有，此时自动降级到后者，配对码与地址照常显示。
+- **登录**：`POST /api/v2/auth/password-salt` 取盐，`passwordVerifier` = PBKDF2-HMAC-SHA256（密码、盐、120000 轮、32 字节）再 base64url；`POST /api/v2/auth/login` 换 `accessToken`（7 天 TTL）。无刷新接口，令牌过期靠静默重登。
+- **两个独立的序列域**：增量轮询游标是时间线信封的 `nextSeq`（事件序号）；翻历史用的是条目上的 `orderSeq`。二者互不通用，混用会把历史翻页弄乱。
+- **提问两类回法**：`input_request` 表单回 `{answers:{问题id:{optionIds,customText?}}}`，`actionId` 用表单自带的；审批/确认类没有表单，**选项 id 就是动作 id**，回哪个动作服务器就执行哪个。
+- **模型目录**：`/runtime/catalogs/model` 按运行时给出 `{models:[{selectionId, reasoningItems:[]}]}`；当前生效值以会话状态里的 `selections` 为准，目录 `default` 只做初次兜底。切换前先 `POST /takeover` 取得控制权再 PATCH。
+- **null 陷阱**：服务端 JSON 的文案字段可能显式为 `null`，`org.json` 的 `optString` 遇 null 会返回 null，所有解析必须经 `Api.text(...)` 兜底。
+- **防闪烁**：界面按「重建整屏」刷新，滚动位置由 `render()` 统一保留；刷新前先比对内容指纹，没变化直接返回；正在输入或刚触摸过（2.5 秒静默期）时跳过刷新。
+- **圆屏适配**：按圆的内接矩形统一留边（左右 15%、上下 18%），整个滚动区都在圆内，页面不需要自己加边距。
+- **自托管服务器**：明文 HTTP 靠 `usesCleartextTraffic` 放行；HTTPS 自签名证书不校验（手表没有便捷的证书安装入口），访问控制由你的账号密码承担。
 
 ## 项目结构
 
@@ -215,73 +102,40 @@ node tests/probe-shapes.mjs                   # 查看 DSH 实际返回的字段
 │       │   ├── MainActivity.java    全部页面与交互逻辑
 │       │   ├── WatchUi.java         圆屏控件与安全区
 │       │   ├── Markdown.java        正文与工具结果的富文本渲染
-│       │   ├── Api.java             HTTP 客户端
-│       │   ├── Store.java           地址与令牌的存取
-│       │   └── Discovery.java       UDP 自动发现
+│       │   ├── Api.java             AA REST 客户端与登录
+│       │   └── Store.java           账号（地址/邮箱/密码/令牌）的存取
 │       └── res/
-├── desktop/                   电脑端桌面程序（C#，单文件 exe）
-│   ├── src/
-│   │   ├── MainForm.cs         窗口与内嵌浏览器
-│   │   ├── NativePanel.cs      零依赖原生界面（降级目标）
-│   │   ├── panel.html          网页控制台
-│   │   ├── RelayServer.cs      中继服务
-│   │   ├── DshClient.cs        DSH 鉴权与 RPC
-│   │   ├── DshLocator.cs       查找本机 DSH 与凭据
-│   │   ├── Steps.cs            会话数据裁剪
-│   │   ├── PublicTunnel.cs     cloudflared 公网中转
-│   │   ├── Bootstrap.cs        内嵌依赖的装载
-│   │   └── StartupLog.cs       启动日志
-│   └── 使用说明.txt            随分发包给使用者的说明
-├── relay/                     命令行中继（Node，SEA 打包）
-│   ├── src/
-│   │   ├── server.mjs          入口与参数解析
-│   │   ├── relay.mjs           面向手表的 REST 接口 + UDP 广播
-│   │   ├── dsh.mjs             DSH 协议与鉴权
-│   │   ├── state.mjs           DSH 数据的裁剪与归一化
-│   │   ├── tunnel.mjs          公网中转
-│   │   └── paths.mjs           取自身目录（打包兼容）
-│   ├── public/index.html       控制面板
-│   └── start-relay.cmd         双击启动
-├── scripts/                   构建脚本
-│   ├── build.ps1               构建手表 APK
-│   ├── build-app.ps1           构建桌面程序
-│   ├── pack-relay.ps1          打包命令行中继
-│   └── bundle-relay.mjs        把中继源码合成单文件
-└── tests/                     自检脚本
+├── scripts/build.ps1          构建脚本（aapt2 → javac → d8 → apksigner）
+├── desktop/ relay/ tests/     原中继方案的遗留代码，仅供参考
+└── docs/                      介绍片素材与投稿文案
 ```
 
 ## 已知边界
 
-- 中继以**明文 HTTP** 提供局域网服务（公网走 HTTPS），并靠 6 位配对码保护。它只应在你信任的网络里运行，用完关掉即可。
-- 手表上一次最多显示 40 条消息 / 60 个会话；更早的历史要点「看更早的内容」逐批加载。
-- 中继需要电脑上的 DSH 桌面版处于运行状态；**关掉中继窗口，手表就断开了**。
-- 公网地址是 cloudflared 的临时隧道，每次启动都会变；需要固定地址得自备域名或反向代理。
-- **Cloudflare 对免注册隧道有频率限制**，短时间内反复开关会提示限流。等几分钟再试即可，局域网功能不受影响。
-- 手表走 HTTPS 时放行全部证书——手表上没有便捷的证书安装入口，访问控制由配对令牌承担。
-- 桌面程序要求 Windows 10 1903 以上或 Windows 11；更早的系统自带 .NET Framework 低于 4.8，需要自行安装。
+- **新建会话的冷启动**：`create-and-start` 要等服务器拉起运行时，客户端把读取超时放宽到 75 秒；更慢的服务器会超时。
+- **轮询而非推送**：会话页 4 秒、列表页 10 秒拉一次增量；没有实时推送，新内容最多延迟一个周期出现。
+- **没有用量页**：AA 接口未提供 token 用量，这一页从中继时代起不复存在。
+- **轮询是无条件拉取**：手表端没有按会话粒度的增量缓存，切换会话会重新拉快照。
+- 电脑上必须有一个**在线的连接器**才能新建会话；连接器离线时新建页会直接提示。
+- 界面按 466×466 圆屏设计（OPPO Watch / Android 11），其它 Wear OS 手表理论可用但未适配。
+- 密码在「记住密码」开启时**明文存在应用私有目录**（SharedPreferences），与 AA 官方客户端的本地凭据存储同级；对安全要求高就关掉它。
 
 ## 常见问题
 
-**提示「没有找到 DSH」？**
-先启动 DSH 桌面版，再重新打开中继。中继需要读取它的凭据，DSH 没运行就读不到。
+**提示「邮箱或密码不正确」？**
+确认登录的是 AA 的账号（网页端能登的那个）。自托管服务器要填你自己的地址。
 
-**手表一直转圈连不上？**
-确认手表和电脑在同一个 WiFi；地址填「局域网」那条（形如 `http://192.168.1.x:19390`），不要填 `127.0.0.1`——那指向手表自己。也检查电脑的防火墙是否拦了 19390 端口。
+**会话列表一直转圈？**
+设置页里的服务器地址要能被手表访问到：云端默认 `https://web.agents-anywhere.com`；自托管填完整 URL（`http(s)://…`）。地址错了健康检查那一步就会报「连不上」。
 
-**配对码会变吗？**
-不会。配对码与令牌都保存在电脑上，中继重启、升级程序都不会变，手表不用重配。只有你主动点「换一个配对码」才会换。
+**新建会话提示「没有在线的连接器」？**
+先在电脑上启动 Agents Anywhere 连接器并确认在线，再回来新建。
 
-**一键配对找不到电脑？**
-确认手表与电脑在同一个 WiFi。Windows 防火墙可能拦了 UDP 19391，允许它通过即可；也可以改用手动填地址与配对码，效果一样。
+**令牌过期后会怎样？**
+「记住密码」开启时会静默重登，继续用；关闭时会退回登录页让你重新输密码。
 
-**中继会改动我的 DSH 配置吗？**
-不会。它只读取 DSH 的登录凭据用于本机通信，不修改任何配置文件，也不安装任何插件。
-
-**关掉窗口后手表还能连吗？**
-不能。中继就运行在这个窗口里，关掉即停止。
-
-**桌面程序打不开或闪退？**
-程序目录下的 `startup.log` 记录了启动全过程（DSH 定位、端口、依赖释放、异常堆栈），这是排查的第一手线索。
+**历史翻不完？**
+每次「看更早的内容」加载 100 条；服务端把更早的历史裁掉时，按钮会变成「已经是最早的内容了」。
 
 ## 许可
 

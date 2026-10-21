@@ -304,6 +304,16 @@ final class WatchUi {
         page.content.addView(line, params);
     }
 
+    /** 同一条分隔线，返回视图本身，供操作菜单面板等非 Page 容器复用。 */
+    View dividerView() {
+        View line = new View(activity);
+        line.setBackgroundColor(LINE);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, Math.max(1, dp(0.6f)));
+        params.setMargins(0, dp(8), 0, dp(8));
+        line.setLayoutParams(params);
+        return line;
+    }
+
     /**
      * 一个通栏按钮。
      *

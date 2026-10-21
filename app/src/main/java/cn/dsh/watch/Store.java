@@ -10,41 +10,53 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 手表侧的本地状态：多个中继设备的连接信息，以及当前正在用的那一台。
+ * 手表侧的本地状态：多个 Agents Anywhere 账号的登录信息，以及当前在用的那一个。
  *
  * 设计要点：
- * - **记住多台设备**。同一块手表可能在「家里电脑的局域网」「公司电脑的局域网」
- *   「某个公网地址」之间来回切，每次都重新输配对码很麻烦。因此每台设备
- *   （地址 + 令牌 + 备注 + 最后使用时间）单独存一条，可随时切换。
- * - **base() / token() 这些原有方法保持语义不变**，它们返回「当前设备」的值。
- *   这样数十处调用点不用改，切换设备后自然生效。
- * - 旧的单设备存档会被自动迁移成列表里的第一条，用户不需要重新配对。
+ * - **记住多个账号**。同一块手表可能在「官方云端」「自建服务器」之间来回切，
+ *   每个账号单独存一条（服务器地址 + 邮箱 + 密码 + 令牌 + 备注 + 最后使用时间），
+ *   可随时切换。
+ * - **base() / token() 保持原有语义**：返回「当前账号」的值，调用点不用关心
+ *   账号切换的细节。
+ * - 邮箱与密码必须保存：AA 的令牌 7 天过期且没有刷新接口，过期后要靠它们
+ *   静默重新登录。存档与本机 SharedPreferences 同级（单用户设备）。
  */
 final class Store {
     private static final String FILE = "dsh-watch";
-    private static final String KEY_BASE = "base";
-    private static final String KEY_TOKEN = "token";
+    /** 账号列表（JSON 数组）。 */
+    private static final String KEY_ACCOUNTS = "accounts";
+    /** 当前账号在列表里的下标。 */
+    private static final String KEY_CURRENT = "currentAccount";
     private static final String KEY_LAST_SESSION = "lastSession";
     private static final String KEY_LAST_SESSION_TITLE = "lastSessionTitle";
 
-    /** 多设备列表（JSON 数组）。 */
-    private static final String KEY_DEVICES = "devices";
-
-    /** 一台已记住的中继设备。 */
-    static final class Device {
-        /** 地址原文，形如 `192.168.1.121:19390` 或 `https://xxx.trycloudflare.com`。 */
+    /** 一个已记住的 AA 账号。 */
+    static final class Account {
+        /** 服务器根地址，形如 https://web.agents-anywhere.com。 */
         String base = "";
+        String email = "";
+        String password = "";
         String token = "";
-        /** 用户可读的备注；为空时界面按地址与网络类型自动取名。 */
+        /** 令牌过期时间（毫秒）；AA 签发 7 天，过期前靠静默重登续期。 */
+        long tokenExpiresAt = 0L;
+        String userId = "";
+        String displayName = "";
+        /** 用户可读的备注；为空时界面用邮箱与服务器地址取名。 */
         String label = "";
-        /** 是否为公网地址（决定显示「公网」还是「局域网」）。 */
         long lastUsed = 0L;
 
         boolean valid() {
-            return base != null && !base.isEmpty() && token != null && !token.isEmpty();
+            return base != null && !base.isEmpty()
+                    && email != null && !email.isEmpty()
+                    && password != null && !password.isEmpty();
         }
 
-        /** 地址里是否带 https（公网）。 */
+        /** 令牌是否还在有效期内（过期时间未知时按可用处理，交给 401 重登兜底）。 */
+        boolean tokenUsable() {
+            return token != null && !token.isEmpty()
+                    && (tokenExpiresAt <= 0 || tokenExpiresAt > System.currentTimeMillis());
+        }
+
         boolean isPublic() {
             return base != null && base.startsWith("https://");
         }
@@ -53,7 +65,12 @@ final class Store {
             JSONObject object = new JSONObject();
             try {
                 object.put("base", base == null ? "" : base);
+                object.put("email", email == null ? "" : email);
+                object.put("password", password == null ? "" : password);
                 object.put("token", token == null ? "" : token);
+                object.put("tokenExpiresAt", tokenExpiresAt);
+                object.put("userId", userId == null ? "" : userId);
+                object.put("displayName", displayName == null ? "" : displayName);
                 object.put("label", label == null ? "" : label);
                 object.put("lastUsed", lastUsed);
             } catch (Exception ignored) {
@@ -62,14 +79,19 @@ final class Store {
             return object;
         }
 
-        static Device fromJson(JSONObject object) {
+        static Account fromJson(JSONObject object) {
             if (object == null) return null;
-            Device device = new Device();
-            device.base = Api.text(object, "base");
-            device.token = Api.text(object, "token");
-            device.label = Api.text(object, "label");
-            device.lastUsed = object.optLong("lastUsed", 0L);
-            return device.valid() ? device : null;
+            Account account = new Account();
+            account.base = Api.text(object, "base");
+            account.email = Api.text(object, "email");
+            account.password = Api.text(object, "password");
+            account.token = Api.text(object, "token");
+            account.tokenExpiresAt = object.optLong("tokenExpiresAt", 0L);
+            account.userId = Api.text(object, "userId");
+            account.displayName = Api.text(object, "displayName");
+            account.label = Api.text(object, "label");
+            account.lastUsed = object.optLong("lastUsed", 0L);
+            return account;
         }
     }
 
@@ -77,156 +99,159 @@ final class Store {
 
     Store(Context context) {
         this.prefs = context.getSharedPreferences(FILE, Context.MODE_PRIVATE);
-        migrateLegacy();
     }
 
-    /**
-     * 把旧的单设备存档迁移成多设备列表。
-     *
-     * 只在「列表为空且旧存档有效」时执行，迁移后清掉旧字段，避免重复迁移。
-     */
-    private void migrateLegacy() {
-        String legacyBase = prefs.getString(KEY_BASE, "");
-        String legacyToken = prefs.getString(KEY_TOKEN, "");
-        if (legacyBase == null || legacyBase.isEmpty() || legacyToken == null || legacyToken.isEmpty()) return;
-        if (!devices().isEmpty()) return;
+    // ------------------------------------------------------------ 账号列表
 
-        Device device = new Device();
-        device.base = legacyBase;
-        device.token = legacyToken;
-        device.lastUsed = System.currentTimeMillis();
-        saveDevices(single(device));
-        prefs.edit().putLong(KEY_CURRENT, 0L).apply();
-    }
-
-    /** 当前设备的索引（相对列表）。 */
-    private static final String KEY_CURRENT = "currentDevice";
-
-    // ------------------------------------------------------------ 设备列表
-
-    /** 读全部已记住的设备（按最后使用时间倒序，最近的在前）。 */
-    List<Device> devices() {
-        List<Device> list = new ArrayList<>();
-        String raw = prefs.getString(KEY_DEVICES, "");
-        if (raw == null || raw.isEmpty()) return list;
+    /** 读全部已记住的账号（按最后使用时间倒序，最近的在前）。 */
+    List<Account> accounts() {
+        List<Account> list = new ArrayList<>();
         try {
-            JSONArray array = new JSONArray(raw);
+            JSONArray array = new JSONArray(prefs.getString(KEY_ACCOUNTS, "[]"));
             for (int i = 0; i < array.length(); i++) {
-                Device device = Device.fromJson(array.optJSONObject(i));
-                if (device != null) list.add(device);
+                Account account = Account.fromJson(array.optJSONObject(i));
+                if (account != null) list.add(account);
             }
         } catch (Exception ignored) {
-            // 存档损坏时当作空列表，用户可以重新配对。
+            // 存档损坏时从空开始，用户重新登录即可。
         }
         list.sort((a, b) -> Long.compare(b.lastUsed, a.lastUsed));
         return list;
     }
 
-    private void saveDevices(List<Device> list) {
-        JSONArray array = new JSONArray();
-        for (Device device : list) array.put(device.toJson());
-        prefs.edit().putString(KEY_DEVICES, array.toString()).apply();
+    /** 当前账号；没有登录过时返回 null。 */
+    Account current() {
+        List<Account> list = accounts();
+        if (list.isEmpty()) return null;
+        int index = prefs.getInt(KEY_CURRENT, 0);
+        if (index < 0 || index >= list.size()) index = 0;
+        return list.get(index);
     }
 
-    private static List<Device> single(Device device) {
-        List<Device> list = new ArrayList<>();
-        list.add(device);
-        return list;
-    }
-
-    /** 当前正在用的设备；未配对时为 null。 */
-    Device current() {
-        for (Device device : devices()) {
-            if (device.base.equals(base())) return device;
-        }
-        return null;
-    }
-
-    /**
-     * 记住（或更新）一台设备，并切换过去。
-     *
-     * 同一地址视为同一台设备——换令牌就覆盖，不会堆出多条。
-     */
-    void rememberDevice(String base, String token, String label) {
-        if (base == null || base.trim().isEmpty() || token == null || token.trim().isEmpty()) return;
-        String address = base.trim();
-        List<Device> list = devices();
-        Device target = null;
-        for (Device device : list) {
-            if (device.base.equals(address)) {
-                target = device;
+    /** 记录一次登录成功（同一 服务器+邮箱 会覆盖，不会堆重复项），并切换为当前账号。 */
+    void saveLogin(String base, String email, String password, String token,
+                   long tokenExpiresAt, String userId, String displayName, String label) {
+        List<Account> list = accounts();
+        Account account = null;
+        for (Account item : list) {
+            if (item.base.equals(base) && item.email.equalsIgnoreCase(email)) {
+                account = item;
                 break;
             }
         }
-        if (target == null) {
-            target = new Device();
-            target.base = address;
-            list.add(target);
+        if (account == null) {
+            account = new Account();
+            list.add(account);
         }
-        target.token = token.trim();
-        if (label != null && !label.trim().isEmpty()) target.label = label.trim();
-        target.lastUsed = System.currentTimeMillis();
-
-        saveDevices(list);
-        prefs.edit()
-                .putString(KEY_BASE, target.base)
-                .putString(KEY_TOKEN, target.token)
-                .apply();
+        account.base = base;
+        account.email = email;
+        account.password = password;
+        account.token = token == null ? "" : token;
+        account.tokenExpiresAt = tokenExpiresAt;
+        account.userId = userId == null ? "" : userId;
+        account.displayName = displayName == null ? "" : displayName;
+        if (label != null && !label.isEmpty()) account.label = label;
+        account.lastUsed = System.currentTimeMillis();
+        persist(list, list.indexOf(account));
     }
 
-    /** 切换到一台已记住的设备。 */
-    void useDevice(Device device) {
-        if (device == null || !device.valid()) return;
-        // 先读列表再改时间：devices() 每次都从存档重建对象，
-        // 改传入对象上的时间不会反映到列表里，必须改列表里的那一条。
-        List<Device> list = devices();
-        for (Device item : list) {
-            if (item.base.equals(device.base)) {
+    /** 静默重登成功后刷新令牌（不动密码与备注）。 */
+    void updateToken(String base, String email, String token, long tokenExpiresAt) {
+        List<Account> list = accounts();
+        for (int i = 0; i < list.size(); i++) {
+            Account account = list.get(i);
+            if (account.base.equals(base) && account.email.equalsIgnoreCase(email)) {
+                account.token = token == null ? "" : token;
+                account.tokenExpiresAt = tokenExpiresAt;
+                account.lastUsed = System.currentTimeMillis();
+                persist(list, i);
+                return;
+            }
+        }
+    }
+
+    /** 切换当前账号（换账号等同于换了一个世界，调用方要清空会话状态）。 */
+    void useAccount(Account account) {
+        if (account == null || !account.valid()) return;
+        List<Account> list = accounts();
+        for (int i = 0; i < list.size(); i++) {
+            Account item = list.get(i);
+            if (item.base.equals(account.base) && item.email.equalsIgnoreCase(account.email)) {
                 item.lastUsed = System.currentTimeMillis();
+                persist(list, i);
+                return;
+            }
+        }
+    }
+
+    /** 删除一个账号。 */
+    void forgetAccount(Account account) {
+        List<Account> list = accounts();
+        for (int i = 0; i < list.size(); i++) {
+            Account item = list.get(i);
+            if (item.base.equals(account.base) && item.email.equalsIgnoreCase(account.email)) {
+                list.remove(i);
                 break;
             }
         }
-        saveDevices(list);
-        prefs.edit()
-                .putString(KEY_BASE, device.base)
-                .putString(KEY_TOKEN, device.token)
-                .remove(KEY_LAST_SESSION)
-                .remove(KEY_LAST_SESSION_TITLE)
+        persist(list, 0);
+    }
+
+    private void persist(List<Account> list, int currentIndex) {
+        JSONArray array = new JSONArray();
+        for (Account account : list) array.put(account.toJson());
+        prefs.edit().putString(KEY_ACCOUNTS, array.toString())
+                .putInt(KEY_CURRENT, Math.max(0, currentIndex))
                 .apply();
     }
 
-    /** 忘掉一台设备。 */
-    void forgetDevice(Device device) {
-        if (device == null) return;
-        List<Device> list = devices();
-        Device removed = null;
-        for (Device item : list) {
-            if (item.base.equals(device.base)) {
-                removed = item;
-                break;
-            }
-        }
-        if (removed == null) return;
-        list.remove(removed);
-        saveDevices(list);
-        if (removed.base.equals(base())) {
-            // 删的正是当前这台：清空当前连接，避免继续拿废令牌去请求。
-            prefs.edit().remove(KEY_BASE).remove(KEY_TOKEN)
-                    .remove(KEY_LAST_SESSION).remove(KEY_LAST_SESSION_TITLE).apply();
-        }
-    }
+    // ------------------------------------------------------------ 当前账号的快捷读取
 
-    // ------------------------------------------------------------ 当前设备（原有语义）
-
-    /** 中继地址（形如 host:port 或 https://host）。 */
+    /** 当前账号的服务器根地址（形如 https://host[:port]）。 */
     String base() {
-        String value = prefs.getString(KEY_BASE, "");
-        return value == null ? "" : value;
+        Account account = current();
+        return account == null ? "" : account.base;
     }
 
+    /** 当前账号的访问令牌。 */
     String token() {
-        String value = prefs.getString(KEY_TOKEN, "");
-        return value == null ? "" : value;
+        Account account = current();
+        return account == null ? "" : account.token;
+    }
+
+    String email() {
+        Account account = current();
+        return account == null ? "" : account.email;
+    }
+
+    String password() {
+        Account account = current();
+        return account == null ? "" : account.password;
+    }
+
+    /** 是否已经登录（有账号且密码在，令牌过期也没关系——会静默重登）。 */
+    boolean paired() {
+        Account account = current();
+        return account != null && account.valid();
+    }
+
+    /** 清除当前账号的令牌（保留账号本身，用于「重新登录」场景）。 */
+    void clearToken() {
+        List<Account> list = accounts();
+        int index = prefs.getInt(KEY_CURRENT, 0);
+        if (index < 0 || index >= list.size()) return;
+        list.get(index).token = "";
+        list.get(index).tokenExpiresAt = 0L;
+        persist(list, index);
+    }
+
+    // ------------------------------------------------------------ 最近会话
+
+    void setLastSession(String sessionId, String title) {
+        prefs.edit()
+                .putString(KEY_LAST_SESSION, sessionId == null ? "" : sessionId)
+                .putString(KEY_LAST_SESSION_TITLE, title == null ? "" : title)
+                .apply();
     }
 
     String lastSession() {
@@ -239,132 +264,77 @@ final class Store {
         return value == null ? "" : value;
     }
 
-    void setBase(String base) {
-        prefs.edit().putString(KEY_BASE, base).apply();
-    }
+    // ------------------------------------------------------------ 地址解析
 
-    void setToken(String token) {
-        prefs.edit().putString(KEY_TOKEN, token).apply();
-    }
-
-    void setLastSession(String sessionId, String title) {
-        prefs.edit()
-                .putString(KEY_LAST_SESSION, sessionId)
-                .putString(KEY_LAST_SESSION_TITLE, title)
-                .apply();
-    }
-
-    /** 断开连接：清除令牌，保留上次地址以便重连时预填。 */
-    void clearToken() {
-        prefs.edit().remove(KEY_TOKEN).remove(KEY_LAST_SESSION).remove(KEY_LAST_SESSION_TITLE).apply();
-        // 列表里对应那台也去掉令牌，否则切换回来又是一个废令牌。
-        String address = base();
-        List<Device> list = devices();
-        boolean changed = false;
-        for (Device device : list) {
-            if (device.base.equals(address)) {
-                device.token = "";
-                changed = true;
-                break;
-            }
-        }
-        if (changed) saveDevices(list);
-    }
-
-    boolean paired() {
-        return !base().isEmpty() && !token().isEmpty();
-    }
-
-    /** 一个解析好的中继地址。 */
+    /** 解析结果：规范化后的根地址 + 协议 + 主机 + 端口。 */
     static final class Endpoint {
-        /** 原始写法，直接用于显示与保存。 */
-        final String raw;
+        final String canonical;
         final String scheme;
         final String host;
         final int port;
 
-        private Endpoint(String raw, String scheme, String host, int port) {
-            this.raw = raw;
+        private Endpoint(String canonical, String scheme, String host, int port) {
+            this.canonical = canonical;
             this.scheme = scheme;
             this.host = host;
             this.port = port;
         }
 
-        boolean isSecure() {
-            return "https".equals(scheme);
-        }
-
-        /** 拼出请求用的完整 URL（含可选端口）。 */
+        /** 拼出以 path 开头的完整地址。 */
         String url(String path) {
-            StringBuilder builder = new StringBuilder();
-            builder.append(scheme).append("://").append(host);
-            // 默认端口不写出来，避免 https://host:443 这类多余写法。
-            boolean defaultPort = ("https".equals(scheme) && port == 443) || ("http".equals(scheme) && port == 80);
-            if (port > 0 && !defaultPort) builder.append(':').append(port);
-            if (!path.startsWith("/")) builder.append('/');
-            builder.append(path);
-            return builder.toString();
+            StringBuilder builder = new StringBuilder(scheme).append("://").append(host);
+            if (!(("https".equals(scheme) && port == 443) || ("http".equals(scheme) && port == 80))) {
+                builder.append(':').append(port);
+            }
+            if (path == null) return builder.toString();
+            return path.startsWith("/") ? builder.append(path).toString() : builder.append('/').append(path).toString();
         }
 
-        /** 用于界面显示的简短形态。 */
+        /** 展示用：带协议的完整地址。 */
         String display() {
-            return raw;
+            return url(null);
         }
     }
 
     /**
-     * 解析用户输入的地址。
+     * 解析用户输入的 AA 服务器地址。
      *
-     * 接受这些写法：
-     * - `192.168.1.121`（默认局域网端口）
-     * - `192.168.1.121:19390`
-     * - `https://dsh.example.com`
-     * - `dsh.example.com`（无协议时按 HTTP 处理，符合局域网习惯）
-     *
-     * @param input 用户输入
-     * @param defaultPort 未写端口时局域网使用的默认端口
-     * @return 解析结果；输入非法时返回 null
+     * 接受 `https://host`、`http://host:port`、`host`（补 https:443）、`host:port`（补 http）。
+     * 与旧中继不同，裸主机名默认按 https 处理：AA 服务器几乎总是走 TLS。
+     * 返回 null 表示格式不合法。
      */
-    static Endpoint parse(String input, int defaultPort) {
-        if (input == null) return null;
-        String text = input.trim();
-        if (text.isEmpty()) return null;
-
-        String scheme = "http";
-        String rest = text;
-        int schemeAt = text.indexOf("://");
-        if (schemeAt > 0) {
-            scheme = text.substring(0, schemeAt).toLowerCase();
-            rest = text.substring(schemeAt + 3);
+    static Endpoint parseServer(String input) {
+        String value = input == null ? "" : input.trim();
+        if (value.isEmpty()) return null;
+        int schemeAt = value.indexOf("://");
+        String scheme = "https";
+        String rest = value;
+        if (schemeAt >= 0) {
+            scheme = value.substring(0, schemeAt).toLowerCase();
             if (!"http".equals(scheme) && !"https".equals(scheme)) return null;
+            rest = value.substring(schemeAt + 3);
         }
-        // 去掉路径与查询，只保留主机部分。
         int slash = rest.indexOf('/');
         if (slash >= 0) rest = rest.substring(0, slash);
-        if (rest.isEmpty()) return null;
-
+        int port = "https".equals(scheme) ? 443 : 80;
         String host = rest;
-        int port = "https".equals(scheme) ? 443 : defaultPort;
-        // IPv6 字面量形如 [::1]:port，这里只在非 IPv6 时按冒号切端口。
-        if (!rest.startsWith("[")) {
+        if (!rest.isEmpty() && rest.charAt(0) != '[' && rest.indexOf(':') == rest.lastIndexOf(':')) {
             int colon = rest.lastIndexOf(':');
             if (colon > 0) {
-                String portText = rest.substring(colon + 1);
                 try {
-                    int parsed = Integer.parseInt(portText);
+                    int parsed = Integer.parseInt(rest.substring(colon + 1));
                     if (parsed <= 0 || parsed > 65535) return null;
                     port = parsed;
                     host = rest.substring(0, colon);
                 } catch (NumberFormatException error) {
-                    // 不是端口，按整体当主机名处理。
+                    // 不是端口，按整体当主机名处理（IPv6 字面量等）。
                 }
             }
         }
         if (host.isEmpty()) return null;
 
-        String canonical = "http".equals(scheme) && port == defaultPort && schemeAt < 0
-                ? host
-                : ("http".equals(scheme) ? host + ":" + port : scheme + "://" + host + (port == 443 ? "" : ":" + port));
+        String canonical = scheme + "://" + host
+                + ((("https".equals(scheme) && port == 443) || ("http".equals(scheme) && port == 80)) ? "" : ":" + port);
         return new Endpoint(canonical, scheme, host, port);
     }
 }

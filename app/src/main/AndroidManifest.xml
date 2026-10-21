@@ -6,16 +6,14 @@
 
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="33" />
 
+    <!-- 直连 AA 云端 / 自托管服务器只需要网络访问权限；
+         原来用于局域网发现的 MULTICAST / WIFI_STATE 权限已随发现链路一并删除。 -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <!-- 局域网地址直连属于明文 HTTP，Android 9 起需要显式放行。 -->
-    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
     <uses-feature android:name="android.hardware.type.watch" android:required="false" />
 
     <application
-        android:label="DSH 手表"
+        android:label="AA 手表"
         android:icon="@drawable/ic_launcher"
         android:theme="@style/AppTheme"
         android:allowBackup="false"
@@ -26,7 +24,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:label="DSH 手表"
+            android:label="AA 手表"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>

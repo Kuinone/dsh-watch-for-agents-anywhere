@@ -1,142 +1,81 @@
-# 项目约束
+# Agents Anywhere 手表版 — 项目约束
+
+本仓库是 [dsh-watch](https://github.com/DING-HAO-RAN/dsh-watch) 的改造分支：手表端从「局域网中继客户端」改为 **Agents Anywhere（AA）云 / 自托管服务器的客户端**（方案 A）。中继、UDP 发现、配对整条链路已删除；`desktop/`、`relay/`、`tests/` 是原方案的遗留代码，仅供参考，不参与手表构建，**不要再往里面投入修改**。
 
 ## 构成
 
-- 三个部件：[桌面程序](<desktop/>)（C#，装在电脑上，日常用这个）、[手表端应用](<app/>)（原生 Java）、[命令行中继](<relay/>)（Node，无界面，供脚本或服务器环境使用）。中继负责 DSH 鉴权与数据裁剪，手表只调用中继自己的简单接口。
-- **桌面程序是主推形态**：一个 exe 拷到任何 Windows 10/11 上双击即用，自动找到本机 DSH 并显示配对码与地址。
-- 中继**不修改 DSH 配置、不依赖任何 DSH 插件**，这是需求方明确要求的前提，改动方案时不得破坏。
-- 地址统一存在 `Store.base` 字段（`host:port` 或 `https://域名`），由 `Store.parse` 解析。**不要再引入第二套地址存取逻辑**。
-- 需求方明确要求「**默认沿用同一端口与密钥，除非用户主动更改**」：配对码与令牌必须跨启动、跨升级保留，不要改回每次都随机生成。
+- 唯一的有效部件是 [app/](<app/>)：原生 Java 手表应用，包名 `cn.dsh.watch`。
+- **HTTP 层集中在 [Api.java](<app/src/main/java/cn/dsh/watch/Api.java>) 一个文件**，界面代码不直接碰 URL。想换自托管服务器，改登录页里的地址即可；改协议时只动 Api.java。
+- [Store.java](<app/src/main/java/cn/dsh/watch/Store.java>) 存的是**账号**（base + email + password + token + userId + displayName + 备注），不是设备列表。`Store.parseServer` 是地址解析的唯一入口，**不要再引入第二套地址存取逻辑**。
+- 换账号（`switchAccount`）时必须清空：会话、`steps`、`openGroups`、`openRows`、`lastListSignature`、待答通知与模型目录，否则上一个账号的状态会套到新界面上。
+- 「记住密码」默认开启：AA 令牌 7 天 TTL 且**无刷新接口**，静默重登依赖本机保存的密码。关闭后令牌过期只能手动登录。
 
-## 配对与多设备
+## AA 协议（实测结论，改动前先复核）
 
-- 桌面程序的配对码与令牌存在 [RelaySettings](<desktop/src/RelaySettings.cs>)：优先 `%LOCALAPPDATA%\dsh-relay\relay-settings.json`，不可写时用程序目录的 `data\`。**`build-app.ps1` 会保留 `data\`**，否则每次重建就丢一次配对（实测过）。
-- **配对码配对成功时不更换**：换了手表下次就得重输，与需求方要求相反。需要换码时由用户点界面上的按钮。
-- 一键配对的链路：手表发 UDP 查询 → 中继单播回复 → 手表 `POST /api/pair/request` → 电脑弹窗 → 用户点「是」→ 中继发放一次性票据 → 手表轮询 `GET /api/pair/result` 拿到 grant → `POST /api/pair {grant}` 换令牌。
-- **`/api/pair/request` 与 `/api/pair/result` 必须先于鉴权判断**（手表这时还没有令牌）。安全边界靠电脑端弹窗，因此这三条防护不能删：
-  1. 同 IP 15 秒冷却 + 待确认请求上限 3（防弹窗轰炸）；
-  2. **grant 必须是独立随机值**，不能复用 `requestId`——requestId 明文回给请求方，复用它等于把用户确认环节架空；
-  3. grant 2 分钟过期并定期清理（`PruneGrants`），否则旧票据永久有效。
-- 手表端 [Store](<app/src/main/java/cn/dsh/watch/Store.java>) 存的是**设备列表**（地址 + 令牌 + 备注 + 最后使用时间），`base()`/`token()` 语义不变仍指「当前设备」，因此三十余处调用点不用改。切换设备时必须清空会话、`steps`、`openGroups`、`openRows` 与 `lastListSignature`，否则上一台设备的状态会套到新界面上。
-- 局域网发现是**双向**的：中继既周期广播也响应手表的查询，且要按网段算定向广播地址（部分路由器丢弃 `255.255.255.255`）。**收发必须用两个独立 socket**——共用一个时，bind 到固定端口后再 Send 在部分 Windows 配置下会静默失败。
-
-## 思考内容
-
-- DSH 的 `assistant/message` 里 `content` 块按 `type` 分三类：`text`、`tool-call`、`reasoning`。实测一条会话里 reasoning 占 35 个、tool-call 59 个、text 仅 5 个——**思考才是占比最高的一类**，早期把它整类丢掉了。
-- reasoning 块与 text 块字段相同（`type` + `text`），由 `Steps.ThinkingOfContent` 单独抽取，写进 `thinking` 字段。手表上做成默认折叠的「思考 ▸」块，展开状态记在 `openRows`（键 `think:<seq>`），否则 4 秒一次的刷新会把它收回去。
-
-## 桌面程序（C#）
-
-- 构建：[scripts/build-app.ps1](<scripts/build-app.ps1>) 用**系统自带的 .NET Framework 4.8 编译器**（`%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`）。这是刻意的选择：产出的 exe 在 Win10 1903+/Win11 上开箱即用，**目标机不需要装 .NET SDK、不需要装 Node.js**。
-- **该编译器只支持 C# 5**：不能用 `$"..."` 字符串插值、`nameof`、表达式体成员。集合初始化器、`var`、lambda、匿名方法都可以。违规时报 `error CS1644: 功能"..."在 C# 5 中不可用`。
-- 界面有两层，**不要把它们合并**：
-  1. **WebView2 网页界面**（[panel.html](<desktop/src/panel.html>) + [MainForm.cs](<desktop/src/MainForm.cs>)）：好看、信息密度高，但依赖 WebView2 运行时；
-  2. **原生界面**（[NativePanel.cs](<desktop/src/NativePanel.cs>)）：纯 WinForms，零依赖，**永远可用**，同时是内嵌浏览器失败时的自动降级目标。
-  这样分层的理由：中继本身不需要浏览器就能工作，精简版 Windows 上可能没有 WebView2；有了第二层，「任何电脑都能打开并显示配对码」才有保证。
-- **依赖全部嵌进 exe**，分发只有一个文件。挂载方式（[Bootstrap.cs](<desktop/src/Bootstrap.cs>)）分两条路，两者都必须保留：
-  - 托管程序集用 `Assembly.Load(byte[])` **从内存装入**（在 `AssemblyResolve` 里实现）；
-  - 原生加载器 `WebView2Loader.dll` **必须落盘**（Win32 的 `LoadLibrary` 只接受路径），优先写程序自身目录，失败再退到临时目录。
-- **绝不要把依赖做成"解压到用户配置目录"**：受控环境（企业策略、沙箱）会拒绝对 `%LOCALAPPDATA%` 的写入，表现为 `Directory.CreateDirectory` 抛"访问被拒绝"，随后 WebView2 报"未能加载程序集"。优先写程序目录就是这个原因。
-- `Bootstrap.Init()` 必须在**任何 WebView2 类型被 JIT 之前**调用，否则类型解析会先失败。
-- 程序目录下的 `startup.log` 记录启动全过程（DSH 定位、端口、依赖释放、异常堆栈）。**GUI 程序闪退时这是唯一的诊断线索**，排查先看它。
-- 判断程序是否真的在运行**不要用 `Get-Process -Name 中文名`**（对中文进程名不可靠，会假报"未找到"）。可靠做法：`tasklist /FO CSV` 过滤，或 `Get-CimInstance Win32_Process -Filter "Name='DSH中继.exe'"`。
-- 从命令行启动 GUI 程序时 `Start-Process`/`& exe` 会阻塞到程序退出，**这不代表失败**。要立即返回并拿到 PID，用 `Invoke-CimMethod -ClassName Win32_Process -MethodName Create`。
-
-## 中继打包（命令行版，SEA）
-
-- 打包链路：`scripts/pack-relay.ps1` → `scripts/bundle-relay.mjs` → Node SEA → postject 注入。
-- `bundle-relay.mjs` 的四条硬规则，改动时不要违反（每条都对应一个真实故障）：
-  1. **保留内置模块导入**并提到文件顶部统一声明，否则运行时报 `join is not defined`；
-  2. **`import path from 'node:path'` 这类默认导入要整体引入**（`const path = require(...)`），拆成 `default: path` 解构会得到 undefined，随后 `path.join` 报错；
-  3. **不要给模块套块级作用域**，否则跨模块使用的函数（如 `moduleDirectory`）不可见；
-  4. **CJS 不允许顶层 await**，入口整体包一层 `async main()`。
-- `import.meta` 在 CJS 里是**语法错误**（不是运行时未定义），所以取目录的逻辑集中在 [paths.mjs](<relay/src/paths.mjs>)，由打包脚本把 `fileURLToPath(import.meta.url)` 改写成 `__filename`；**不要在别处再写 import.meta**。
-- postject 只在打包时需要，本机缓存在 `%LOCALAPPDATA%\dsh-relay-pack`；`npx postject` 在本机 shell 下解析不到包名，必须直接调用它的 `dist/cli.js`。
-- 控制面板只在 loopback 上提供（`/` 与 `/local/state`），面板文件随分发包放在 `public/`，**开发时与打包后的相对位置不同**，`PANEL_DIR` 会依次探测两处。
-- **`pack-relay.ps1` 与 `build-app.ps1` 的输出目录必须分开**：前者出 `dist/中继命令行版/`，后者出 `dist/DSH中继/`。两个脚本启动时都会清空自己的输出目录，共用同一个目录时后跑的那个会把先跑的产物删掉。
-
-## 发布
-
-- 仓库：[DING-HAO-RAN/dsh-watch](https://github.com/DING-HAO-RAN/dsh-watch)（公开）。
-- 一键发布：[scripts/release.ps1](<scripts/release.ps1>) 串起「建 release → 传两个资产 → 下载回来比对哈希」。事后要改说明用 [scripts/update-release-notes.mjs](<scripts/update-release-notes.mjs>)。
-- **GitHub 会剥掉 Release 资产名里的非 ASCII 字符**（`DSH中继.exe` 会变成 `DSH.exe`，label 也会被丢掉），所以发布用的文件名固定为 `DSH-Relay.exe` 与 `DSH-Watch.apk`，README 与实际资产名必须一致。改完要下载回来比对哈希。
-- 上传资产用**只带文件的 POST**，不要把 `--data-urlencode` 与 `--data-binary` 混在同一条 curl 里——两者会拼进同一个请求体，产出的资产比源文件大出一截且内容损坏。
-- **发请求体必须显式转成 UTF-8 字节**。`Invoke-RestMethod` 直接接 `ConvertTo-Json` 的字符串时，中文会被替换成 `?`——实测整段发布说明 915 个字符全变问号，而接口返回 200、看不出异常。用 Node 的 `fetch`（字符串天然按 UTF-8 编码）或先 `[Text.UTF8Encoding]::GetBytes(...)` 都可以，**改完必须把内容拉回来校验是否含中文**，不能只看请求成功。
-- **PATCH 更新 release 只能按 release id**，按 tag 打会 404。
-- 凭据复用 `git push` 已存的那份（Windows 凭据管理器，无需额外配置）。取法：`git credential fill` 需要逐行协议文本 + 结尾空行——PowerShell 管道喂进去会报 `credential missing protocol field`，而 PowerShell 又不支持 `<` 重定向，所以走「临时文件 + cmd」或 Node 的 `execFileSync(..., { input })`。
-- 命令行版中继（打包后约 88 MB）**不进 Releases**，公网访问用的 `cloudflared.exe`（约 53 MB）同样不随包提供，缺了它只影响公网功能。
-- **发布产物必须从 `git archive HEAD` 导出的干净副本里构建**，不能直接用工作树：本机常有其它会话正在改这个项目，工作树里的代码未必是已提交的那份。
-
-## 公网中转
-
-- 桌面程序与命令行版都支持公网中转，拉起 cloudflared 生成一条临时 `*.trycloudflare.com` 地址。查找顺序：程序目录 → `relay/bin/` → DSH 插件目录 → PATH。
-- **Cloudflare 对免注册隧道有频率限制**，短时间内反复开关会返回 HTTP 429。桌面程序为此做了 4 轮递增退避重试，且看到 429 立即收工而不是等满超时——**不要把这个重试去掉**，去掉后用户点一次就会拿到失败弹窗。局域网功能不受影响。
-- 手表端走 HTTPS 时放行全部证书（`Api.insecureFactory`）——手表上没有便捷的证书安装入口，访问控制由配对令牌承担。
-
-## DSH 协议（实测结论，改动前先复核）
-
-- 鉴权 cookie：名字 `dsh-auth-<b64url(sha256(authority))>`，值 `v1.<b64url(payload)>.<b64url(hmac-sha256(secret,body))>`；密钥在 `~/.dsh/.credentials.yaml` 的 `client-connection/browser-session.secret`。**有效期不得超过 DSH 的 cookieMaxAgeDays（默认 30 天）**，否则 401。
-- 一元 RPC：`POST /api/<namespace>/<method>`（斜杠分隔），信封 `{type:"client-request",rpcId,method,payload:{args}}`，应答 `{type:"server-response",rpcId,result:{ok,value|error}}`。
-- 参数名不统一，新增端点必须先核对 descriptor：`session/list` 用 `_request`；`session/page|prompt|create|cancel|projections` 用 `request`；`userQuestions/answer` 的 `agentId` 在 args 顶层。`tests/check-protocol.mjs` 覆盖了这些。
-- 提问有两条通道：`open` 状态只经 WebSocket `$events` 流下发且**不带 callId**，必须用 `$events/result` 按 `clientId+eventId` 回填；`continued` 状态才用 `userQuestions/answer`。中继按情况自动选路，不要把两条合并成一条。
-- DSH 在新客户端接入事件流时会重放所有待处理事件；中继据此在「有会话运行但看不到提问」时重连补齐。
-- 会话事件里混有大量系统注入的 `user/message`（时间上下文、记忆快照、指令），只保留 `source.kind` 为 `user` / `user-question-reply` 的才是真人消息。
+- 登录：`POST /api/v2/auth/password-salt {email}` 取盐 → `passwordVerifier` = PBKDF2-HMAC-SHA256（密码、盐 UTF-8、**120000 轮**、32 字节）→ base64url 无填充 → `POST /api/v2/auth/login {email, passwordVerifier}` 换 `{userId, accessToken, ...}`。7 天 TTL。401 时静默重登一次，再失败清令牌回登录页。
+- 每个请求都带 `Accept: application/json` 与 `ngrok-skip-browser-warning: true`（自建服务器架在 ngrok 后面时没有它会被拦成网页）；JSON body 加 `Content-Type: application/json; charset=utf-8`；空 POST body 用 `{}`。
+- FastAPI 错误是 `{"detail":...}`；RPC 风格响应在 HTTP 200 里带 `{ok, result, error}`，`ok:false` 不是网络失败。两者都要翻译成中文给用户。
+- REST 列表响应有包裹键：`sessions` / `projects` / `connectors` / `runtimes` / `state` / `notices` / `catalog`（模型目录外层多一层 `catalog`，Api 已解包）。`POST /sessions/read` 的 body 是**纯 JSON id 数组**。
+- 新建会话走 `POST /sessions/create-and-start`，服务器要拉起运行时，**读取超时放宽到 75 秒**。
+- **两个独立的序列域**：增量轮询游标是时间线信封的 `nextSeq`（事件序号）；翻历史用条目上的 `orderSeq`（最早一条减 1 往回翻）。二者互不通用，混用会把历史翻页弄乱。
+- 提问两类回法：`input_request` 表单回 `{answers:{问题id:{optionIds,customText?}}}`，`actionId` 用表单自带的；审批/确认类没有表单，**选项 id 就是动作 id**。只有 `type=="interaction"` 且 `responseRequired` 且状态 `open|responding` 的通知可答。
+- 模型目录 `/runtime/catalogs/model` 给 `{models:[{selectionId, reasoningItems:[...]}]}`；当前生效值以会话状态的 `selections` 为准，目录 `default` 只做初次兜底。切换要先 `POST /takeover` 再 PATCH selections；这条链路**刻意不做 401 静默重登**，失败直接报给用户。
+- **null 陷阱**：服务端文案字段可能显式为 `null`，`org.json` 的 `optString` 遇 null 返回 null，所有解析必须经 `Api.text(...)` 兜底，否则界面会崩。
 
 ## 构建
 
-- 环境变量用 `JAVA_HOME` / `ANDROID_HOME` / `WATCH_BUILD_ROOT` 指定，**不要把本机路径写进仓库**。
-- 构建走 [scripts/build.ps1](<scripts/build.ps1>)，直接调用 SDK 工具链。三个必须保留的写法（去掉就会踩坑）：
+- 构建走 [scripts/build.ps1](<scripts/build.ps1>)，直接调用 SDK 工具链（aapt2 → javac → d8 → zipalign → apksigner），无 Gradle。环境用 `JAVA_HOME` / `ANDROID_HOME` 指定，**不要把本机路径写进仓库**。
+- `BuildRoot`（或 `WATCH_BUILD_ROOT`）**必须在项目目录之外**，脚本会拒绝在工作树里构建——避免把临时产物和签名私钥混进版本库。
+- 脚本是 UTF-8 **带 BOM**：Windows PowerShell 5.1 读无 BOM 文件会按 GBK 解码，中文注释直接变成语法错误。改动脚本时保留 BOM。
+- 三个必须保留的写法（去掉就会踩坑）：
   1. 外部命令输出重定向到文件后判退出码——PowerShell 5.1 在 `ErrorActionPreference='Stop'` 下会把 javac 的过时警告当致命错误中断构建，从而**掩盖真正的编译错误**；
   2. 源码与 class 清单写文件后用 `@file` 传参——数组经 shell 展开会被拆坏，导致 d8 静默漏掉大部分类，手表上表现为 `NoClassDefFoundError`；
   3. 用 JDK 的 `jar` 工具把 dex 追加进包——受限语言模式下不可用 .NET 的 ZipFile。
-- `build.ps1` 会逐个核对 `MainActivity` / `WatchUi` / `WatchUi$Page` / `Store` / `Api` / `Discovery` 六个 class 是否存在，这是拦截「类漏编」的最小门禁。
+- `build.ps1` 会逐个核对 `MainActivity` / `WatchUi` / `WatchUi$Page` / `Store` / `Api` 五个 class 是否存在，这是拦截「类漏编」的最小门禁。新增顶层类时同步维护这个清单。
 
 ## 界面
 
-- 圆屏安全区由 [WatchUi](<app/src/main/java/cn/dsh/watch/WatchUi.java>) 的 `page()` 一处负责：按圆的内接矩形留边（左右 15%、上下 18%）。四角到圆心约 0.474 < 半径 0.5（余量约 12px），**整个滚动区都在圆内，可见内容天然安全**，页面不要自己再加边距。
-- **绝不要按控件自身的屏幕位置去动态调边距**。曾经这样做过（`applyRoundInsets`）：它形成布局反馈环——算边距 → 控件变窄 → 文字折行 → 位置变化 → 再算出不同边距，最终把同排按钮压成宽窄不一的窄条且无法拉伸。基础安全区已经足够。
+- 圆屏安全区由 [WatchUi](<app/src/main/java/cn/dsh/watch/WatchUi.java>) 的 `page()` 一处负责：按圆的内接矩形留边（左右 15%、上下 18%）。**整个滚动区都在圆内，可见内容天然安全**，页面不要自己再加边距。
+- **绝不要按控件自身的屏幕位置去动态调边距**。它形成布局反馈环——算边距 → 控件变窄 → 文字折行 → 位置变化 → 再算出不同边距，最终把同排按钮压成宽窄不一的窄条且无法拉伸。基础安全区已经足够。
 - 按钮用 `TextView` + 自绘背景实现（`WatchUi.button`），**不用 `android.widget.Button`**：后者带 9-patch 背景与固有最小宽度，在窄圆屏上会被顶住而撑不满整行。按钮必须单行显示，宽度交给父容器（`LayoutParams(-1, -2)`）。
 - 同排两个按钮用 `weighted()`（`weight=1` 平分）；**之后不要再改它们的 layoutParams 或加 margin**，那会破坏 weight 分配。
 - 可点区域不低于 48dp；**操作入口尽量收进左滑菜单**，页面上只留最常用的两个按钮，把高度让给内容。
-- 标题必须单行（`WatchUi.headingView` 已设 `setSingleLine`）。圆屏可视高度只有三百多像素，标题一旦折成两三行，按钮和内容区就被挤出屏幕、整页也滚不动。截断用 `clipLine`（只加省略号），**不要用 `cut`**（它会插入换行，等于把标题变成两行）。
+- 标题必须单行（`WatchUi.headingView` 已设 `setSingleLine`）。圆屏可视高度只有三百多像素，标题一旦折成两三行，按钮和内容区就被挤出屏幕。截断用 `clipLine`（只加省略号），**不要用会插换行的写法**。
 - **绝不能让「渲染 → 发请求 → 回调再渲染」形成环**。列表页曾经如此：`showSessionList()` 里发请求，回调又调 `showSessionList()`，屏幕每轮都重建、持续上下抽动。现在的分工是：`showSessionList()` 只在进入页面时调用一次，回调一律走 `renderSessionListPage()`（只重绘、不发请求）。
 - 界面用「重建整屏」的方式刷新，因此**滚动位置由 `render()` 统一保留**，换页时才调 `resetScroll()` 回顶部。会话页（4 秒）与会话列表（10 秒）都会定时刷新，不做这件事用户就翻不动列表和长对话。
 - 刷新前先比对**内容指纹**，没变化就直接返回。定时刷新还额外受两道闸约束：用户刚触摸过（2.5 秒静默期）、或正在编辑时跳过。
-- **需要用户停留的页面**（发消息、打字回答、选项答题）必须先置 `editing = true` 暂停自动刷新，否则刚打开的界面会被立刻换掉。
-- 服务端 JSON 的文案字段可能显式为 `null`；`org.json` 的 `optString(key, default)` 遇 null 会返回 null，必须经 `Api.text(...)` 兜底，否则界面会崩。
+- **需要用户停留的页面**（发消息、打字回答、选项答题、模型选择）必须先置 `editing = true` 暂停自动刷新，否则刚打开的界面会被立刻换掉。
+- 服务端 JSON 的文案字段可能显式为 `null`；`Api.text(...)` 兜底是硬性规则（见协议一节）。
 
 ## 手势与操作菜单
 
 - 横向手势在 `MainActivity.dispatchTouchEvent` 里判定，**不能**挂在页面根容器上——子层 `ScrollView` 会先消费触摸，左滑会被当成纵向滚动。
 - 判定要用**整个手势期间的最大位移**，不能只看抬手那一帧：注入的滑动常被拆成很多小步，逐帧看会漏判。门槛为横向 ≥44dp 且大于纵向的 1.2 倍。
-- 约定：**右滑返回上一级，左滑打开操作菜单**。方向必须一致——左滑是「把右侧的内容拉出来」，因此菜单面板**贴右边缘、从右滑入**（180ms 位移 + 淡入）；面板放左边会让人觉得手势反了。关闭用 150ms 反向动画，动画结束才移除视图并允许下一次打开。
+- 约定：**右滑返回上一级，左滑打开操作菜单**。方向必须一致——左滑是「把右侧的内容拉出来」，因此菜单面板**贴右边缘、从右滑入**（140ms 位移 + 淡入）；面板放左边会让人觉得手势反了。关闭用 150ms 反向动画，动画结束才移除视图并允许下一次打开。
 - 正文与工具结果都经 [Markdown](<app/src/main/java/cn/dsh/watch/Markdown.java>) 渲染：标题放大加粗、列表带圆点、行内代码等宽加底色、引用变灰、表格压成一行、代码块整体等宽。工具读出的 .md 文本因此能直接可读。
-- 工具调用按**正文分界**分组，不是按「相邻的工具步骤」：中继为每次工具调用插一条空文本助手步骤（只承载工具清单），相邻工具步骤几乎从不相邻，按相邻关系分组会让每次调用各自成组（实测 49 个会话里几乎全是单条组）。折叠分两级——点卡片列出这次连续调用的清单，点清单里某一条才看它的参数与结果；收组时连带清掉内部明细，下次打开是干净的清单。
-- **展开状态必须记在 `openGroups` / `openRows` 里**（键为 `groupKey` 拼组内下标）。界面是重建整屏刷新，展开状态若只存在于视图上，会话页每 4 秒一次的刷新就会把用户刚点开的详情缩回去——这正是「点了展开却看不到内容」。还原走 `restoreCollapsed` 直接设可见性、不走动画，否则整屏重建时每张卡片都闪一遍。
-- 收组监听器只挂标题、摘要与「展开/收起」提示三处，**不要挂整张卡片**：清单区域必须留给单条明细，否则「点这一条」被卡片抢走，变成把整组收起来。清单行整行可点（`rowBox`，`minHeight 48dp`），只挂标题那一小块时点行内空白同样会落到卡片上。
-- 模型选择页三级（供应商 → 模型 → 推理强度）共用 `currentChoice()`：按「会话用量 → 会话摘要 → 目录 default」依次取值，都不存在时不臆造模型名。`usage` 为空（新建会话还没产生回复）时前两者都没有，靠 `Api.parseModelDefault` 兜底。
-- 长路径会占满圆屏，展示前一律经 `shortenPaths` / `shortPath` 压成末两段。
+- 工具调用按**正文分界**分组，不是按「相邻的工具步骤」：时间线里工具与正文平铺、中间几乎总隔着一条消息步骤，按相邻关系分组会让每次调用各自成组，折叠就失去意义。折叠分两级——点卡片列出连续调用的清单，点清单里某一条才看参数与结果；收组时连带清掉内部明细，下次打开是干净的清单。
+- **展开状态必须记在 `openGroups` / `openRows` 里**（工具组键 `groupKey`，行键 `groupKey#i`，思考块键 `think:<seq>`）。界面是重建整屏刷新，展开状态若只存在于视图上，会话页每 4 秒一次的刷新就会把用户刚点开的详情缩回去——这正是「点了展开却看不到内容」。还原直接设可见性、**不走动画**，否则整屏重建时每张卡片都闪一遍。
+- 收组监听器只挂标题与摘要两处，**不要挂整张卡片**：清单区域必须留给单条明细，否则「点这一条」被卡片抢走，变成把整组收起来。清单行整行可点（`rowBox`，`minHeight 48dp`）。
+- 模型选择两级（模型 → 推理强度）：AA 目录没有供应商层级，Api 把整个目录包成一个名为「模型」的 `ProviderInfo` 以复用既有结构；显示时不要把它再拆成三级。当前值取「会话状态 selections → 目录 default」，不存在时不臆造模型名。
+- 长路径会占满圆屏，展示前一律经 `shortenPaths` / `shortPath` 压成最后一段。
 
 ## 测试
 
-- 三个只读/半只读自检脚本：`tests/check-protocol.mjs`（端点参数形态）、`tests/check-features.mjs`（项目分组、步骤详情、模型目录、用量、翻页）、`tests/e2e.mjs`（配对、列表、读消息、发消息）。
-- **`check-features.mjs` / `answer-once.mjs` / `send.mjs` 不带 `--token` 时会去读 `~/.dsh-watch-relay.json`**，那是**命令行版中继**的存档；桌面程序的令牌只存在内存里，不落这个文件。因此对着桌面程序跑而不显式传 `--token` 时，会拿到旧令牌或空令牌，**表现为 8 条用例全红**（「列表失败」「缺少样本会话」），容易被误判成功能坏了。稳妥做法是另起一个带 `--state-file` 的命令行中继，配对取新令牌后再跑。
-- **配对码现在不再「用一次就换」**（按需求方要求改为沿用），所以同一台中继的配对码在多次测试间是稳定的，可以从 `/local/state` 反复取用。要让它换新只有两条路：点界面上的「换一个配对码」，或删掉设置文件。
-- **`e2e.mjs` 挑样本会话有两条硬要求**，否则会误报失败：
-  1. 必须**有正文**——列表首项常是刚建的空会话；
-  2. 必须**空闲**（`running !== true`）——DSH 对运行中的会话会把新消息放进队列而不立即写入历史，此时查历史必然找不到。发送用例因此单独建一个空白会话。
-- 涉及界面行为的改动，用 `adb` 在真机上从实际入口走一遍（启动 → 点项目 → 点会话 → 发消息 / 答题）。
+- 目前没有自动化测试：原 `tests/` 下的脚本都是对着**中继**跑的，不适用于 AA。协议层的核对靠 [Api.java](<app/src/main/java/cn/dsh/watch/Api.java>) 里的注释与 AA 手机客户端 / 网页端的实际行为对照。
+- 涉及界面行为的改动，用 `adb` 在真机上从实际入口走一遍（启动 → 登录 → 点项目 → 点会话 → 发消息 / 答题 / 切模型）。
 - 手表上验证输入框内容要看截图：`uiautomator dump` 对第三方 `EditText` 常读到空值。
 - 验证「界面是否还在闪」不要靠肉眼看截图：间隔几秒连拍数张，比对文件哈希；哈希一致即画面稳定。
+- 没接 adb 时，构建通过 + 代码审查是最低门槛；**每次改完必须跑 `scripts/build.ps1` 确认零编译错误**。
 
+## 发布
 
-## 介绍片素材
-
-- 成片与封面放在 `docs/`：`DSH手表-项目介绍.mp4`（1920×1080 / 60fps / 约 70 秒 / 11MB）、`DSH手表-视频封面-16x9.png`、`DSH手表-视频封面-4x3.png`。**都不进版本库**（`.gitignore` 已忽略），只在本机留档。
-- 投稿文案在 `docs/B站投稿文案.md`（标题 / tag / 简介 / 置顶评论，**进版本库**）。简介正文 1725 字，距 B 站 2000 字上限留余量，再加内容先删同量的旧内容。
+- 仓库：[DING-HAO-RAN/dsh-watch](https://github.com/DING-HAO-RAN/dsh-watch)（上游，MIT）。本分支的产物名固定为 `AA手表.apk`（[README](<README.md>) 与之一致）。
 - 仓库用 **MIT 协议**（[LICENSE](<LICENSE/>)，版权署名用仓库标识 `DING-HAO-RAN`，不写个人姓名与邮箱）。改协议要同步三处：`LICENSE`、README 的许可段、`relay/package.json` 的 `license` 字段。
-- 制作脚本在 `docs/介绍片制作/`（含字体，24MB，`.gitignore` 已忽略）：`player.html` 用一个纯函数 `render(t)` 描述每一帧，`render.mjs` 通过 CDP 驱动无头 Edge 按时间点逐帧截图，`tts.mjs` 调曼波 TTS 生成配音，`bgm.mjs` 用纯数学合成背景音乐，`audio.mjs` / `encode.mjs` 负责混音与编码。
+- 成片与封面放在 `docs/`（**不进版本库**，`.gitignore` 已忽略）；投稿文案在 `docs/B站投稿文案.md`（进版本库）。简介正文距 B 站 2000 字上限留余量，再加内容先删同量的旧内容。
 - **画面不许用 CSS 动画**：逐帧截图时 CSS 动画不受控，同一 `t` 会截到不同画面。所有随时间变化的量都必须由 `t` 直接算出来。
-- 只改某一镜时不要重渲全片（60fps 下 4201 帧约 20 分钟）：用 `node render.mjs 60 <目录> <起> <止>` 只渲染该区间，再按 `round(t*60)` 把帧写回 `frames/` 对应编号。
-- **配音稿改了就全部重配**：`tts.mjs` 会重写 `timeline.json`，而画面里每一镜的节奏点都挂在 `S.start` 上，时间轴一动整片都要重渲。
 - 旁白每行 ≤30 字、语速 `speed=-6`；字幕直接用旁白原句（静音也要能读懂），画面上的大字只写旁白里没有的事实，两者刻意不重复。
+
+## 敏感信息
+
+- **绝不把用户凭据（邮箱、密码、令牌、userId）写进代码、git、日志或回复**。账号数据只存在手表本地 SharedPreferences（应用私有目录）。
+- 仓库里的 `desktop/`、`relay/`、`tests/` 属于旧方案，其中可能引用本机路径或历史令牌，不要把它们的内容当作现状。

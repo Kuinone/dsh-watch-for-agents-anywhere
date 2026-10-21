@@ -1,4 +1,4 @@
-# 构建手表 APK（在 PowerShell 5.1 下也能稳定运行的版本）。
+﻿# 构建手表 APK（在 PowerShell 5.1 下也能稳定运行的版本）。
 #
 # 三个必须注意的坑，都在这里绕开了：
 # 1. PowerShell 5.1 会把原生命令写到 stderr 的内容当成 NativeCommandError 并中断流程，
@@ -117,7 +117,7 @@ try {
     if ($code -ne 0) { Read-Log 'javac'; throw "javac 失败（退出码 $code）" }
 
     # 逐类核对：缺一个都会在手表上变成 NoClassDefFoundError，必须在这里挡住。
-    $expected = @('MainActivity', 'WatchUi', 'WatchUi$Page', 'Store', 'Api', 'Discovery')
+    $expected = @('MainActivity', 'WatchUi', 'WatchUi$Page', 'Store', 'Api')
     $classesDir = Join-Path $build 'classes'
     foreach ($name in $expected) {
         $file = Join-Path $classesDir ('cn/dsh/watch/' + $name + '.class')
@@ -169,7 +169,7 @@ try {
     if ($code -ne 0) { Read-Log 'apksigner'; throw "签名失败（退出码 $code）" }
 
     New-Item -ItemType Directory -Force $OutputDir | Out-Null
-    $final = Join-Path $OutputDir 'DSH手表.apk'
+    $final = Join-Path $OutputDir 'AA手表.apk'
     Copy-Item -LiteralPath $signed -Destination $final -Force
     Write-Host "构建成功：$final（$((Get-Item -LiteralPath $final).Length) 字节）"
 } finally {
