@@ -172,6 +172,8 @@ final class Api {
                 connection.setRequestProperty("Authorization", "Bearer " + token);
             }
             if (body != null) {
+                // 官方客户端发 JSON 时固定带 charset；不带的话个别网关会当成表单或纯文本。
+                connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
                 connection.setDoOutput(true);
                 byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
                 connection.setFixedLengthStreamingMode(payload.length);
@@ -313,8 +315,30 @@ final class Api {
             case "user no longer exists": return "账号已被删除";
             case "account disabled": return "账号已被禁用";
             case "registration is closed": return "该服务器已关闭注册";
-            default: return message;
+            // 发消息 / 切模型的高频冲突（服务器原文见 session_run.py）：
+            case "session is read-only until takeover is enabled":
+                return "会话是只读的，先开启接管再操作";
+            case "connector is offline":
+                return "电脑上的连接器不在线";
+            case "session not found":
+                return "会话不存在或已被删除";
+            default: break;
         }
+        // "session is running" / "session is starting" 这类动态状态：会话忙，先等等。
+        if (message.startsWith("session is ")) {
+            String state = message.substring("session is ".length()).trim();
+            String name;
+            switch (state) {
+                case "running": name = "正在运行"; break;
+                case "starting": name = "正在启动"; break;
+                case "stopping": name = "正在停止"; break;
+                case "waiting": case "waiting_approval": name = "在等你回复"; break;
+                case "archived": name = "已归档"; break;
+                default: name = state;
+            }
+            return "会话" + name + "，稍后再试";
+        }
+        return message;
     }
 
     // ------------------------------------------------------------ 登录
@@ -532,6 +556,24 @@ final class Api {
                 body, true, result -> deliver(callback, rpcResult(result)));
     }
 
+    /**
+     * 开启接管。
+     *
+     * AA 的会话默认只读（`takeover=false`）：发消息、改模型前服务器都要求先
+     * `POST /takeover`，否则回 RPC 冲突 "session is read-only until takeover is
+     * enabled"。接管是持久状态（用 DELETE 关闭），开着不影响正常使用。
+     */
+    void enableTakeover(String sessionId, Callback callback) {
+        request("POST", "/sessions/" + urlEncode(sessionId) + "/takeover", new JSONObject(), true,
+                result -> deliver(callback, rpcResult(result)));
+    }
+
+    /** 关闭接管（会话回到只读）。 */
+    void disableTakeover(String sessionId, Callback callback) {
+        request("DELETE", "/sessions/" + urlEncode(sessionId) + "/takeover", null, true,
+                result -> deliver(callback, rpcResult(result)));
+    }
+
     /** 模型目录（含推理档位）。响应包在 `catalog` 键里，这里直接解包。 */
     void models(String sessionId, Callback callback) {
         request("GET", "/sessions/" + urlEncode(sessionId) + "/runtime/catalogs/model", null, true, result -> {
@@ -616,6 +658,8 @@ final class Api {
         String status = "idle";
         String runtime = "";
         String cwd = "";
+        /** 是否已接管。只读会话不能发消息、不能改模型。 */
+        boolean takeover;
 
         /** 列表页的副标题：状态 + 相对时间。 */
         String subtitle() {
@@ -818,6 +862,8 @@ final class Api {
             session.waiting = "waiting".equals(session.status) || "waiting_approval".equals(session.status)
                     || "pending".equals(session.status) || "blocked".equals(session.status);
             session.unread = item.optBoolean("unread", false);
+            // 接管状态：false 时会话只读，发消息 / 切模型前要先 POST /takeover。
+            session.takeover = item.optBoolean("takeover", false);
             session.updatedAt = parseTime(text(item, "sortAt"));
             if (session.updatedAt == 0) session.updatedAt = parseTime(text(item, "lastActivityAt"));
             sessions.add(session);

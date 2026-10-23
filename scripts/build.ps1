@@ -117,7 +117,7 @@ try {
     if ($code -ne 0) { Read-Log 'javac'; throw "javac 失败（退出码 $code）" }
 
     # 逐类核对：缺一个都会在手表上变成 NoClassDefFoundError，必须在这里挡住。
-    $expected = @('MainActivity', 'WatchUi', 'WatchUi$Page', 'Store', 'Api')
+    $expected = @('MainActivity', 'WatchUi', 'WatchUi$Page', 'Store', 'Api', 'Notify', 'Markdown')
     $classesDir = Join-Path $build 'classes'
     foreach ($name in $expected) {
         $file = Join-Path $classesDir ('cn/dsh/watch/' + $name + '.class')
@@ -169,7 +169,7 @@ try {
     if ($code -ne 0) { Read-Log 'apksigner'; throw "签名失败（退出码 $code）" }
 
     New-Item -ItemType Directory -Force $OutputDir | Out-Null
-    $final = Join-Path $OutputDir 'AA手表.apk'
+    $final = Join-Path $OutputDir 'DSH Watch.apk'
     Copy-Item -LiteralPath $signed -Destination $final -Force
     Write-Host "构建成功：$final（$((Get-Item -LiteralPath $final).Length) 字节）"
 } finally {

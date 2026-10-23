@@ -20,6 +20,7 @@
 - **两个独立的序列域**：增量轮询游标是时间线信封的 `nextSeq`（事件序号）；翻历史用条目上的 `orderSeq`（最早一条减 1 往回翻）。二者互不通用，混用会把历史翻页弄乱。
 - 提问两类回法：`input_request` 表单回 `{answers:{问题id:{optionIds,customText?}}}`，`actionId` 用表单自带的；审批/确认类没有表单，**选项 id 就是动作 id**。只有 `type=="interaction"` 且 `responseRequired` 且状态 `open|responding` 的通知可答。
 - 模型目录 `/runtime/catalogs/model` 给 `{models:[{selectionId, reasoningItems:[...]}]}`；当前生效值以会话状态的 `selections` 为准，目录 `default` 只做初次兜底。切换要先 `POST /takeover` 再 PATCH selections；这条链路**刻意不做 401 静默重登**，失败直接报给用户。
+- **只读与接管**：会话默认 `takeover=false`，服务器对发消息 / 切模型一律回 RPC 冲突（原文 "session is read-only until takeover is enabled"）。手表端在 `sendMessage` 前检查该字段：只读 → 先弹「开启接管？」确认页 → `POST /sessions/{id}/takeover` → 成功后自动继续发送；`applySelections` 内部已自带 takeover。接管是**持久状态**（`DELETE` 关闭），开启后官方手机端/网页端不会实时回滚。列表接口与快照的 `session` 对象都带 `takeover` 字段，快照的优先（更新）。
 - **null 陷阱**：服务端文案字段可能显式为 `null`，`org.json` 的 `optString` 遇 null 返回 null，所有解析必须经 `Api.text(...)` 兜底，否则界面会崩。
 
 ## 构建
@@ -31,11 +32,12 @@
   1. 外部命令输出重定向到文件后判退出码——PowerShell 5.1 在 `ErrorActionPreference='Stop'` 下会把 javac 的过时警告当致命错误中断构建，从而**掩盖真正的编译错误**；
   2. 源码与 class 清单写文件后用 `@file` 传参——数组经 shell 展开会被拆坏，导致 d8 静默漏掉大部分类，手表上表现为 `NoClassDefFoundError`；
   3. 用 JDK 的 `jar` 工具把 dex 追加进包——受限语言模式下不可用 .NET 的 ZipFile。
-- `build.ps1` 会逐个核对 `MainActivity` / `WatchUi` / `WatchUi$Page` / `Store` / `Api` 五个 class 是否存在，这是拦截「类漏编」的最小门禁。新增顶层类时同步维护这个清单。
+- `build.ps1` 会逐个核对 `MainActivity` / `WatchUi` / `WatchUi$Page` / `Store` / `Api` / `Notify` / `Markdown` 七个 class 是否存在，这是拦截「类漏编」的最小门禁。新增顶层类时同步维护这个清单。
+- **调用方式**：在本机代理环境里 `powershell -File build.ps1` 下 `$PSScriptRoot` 会是空串（Split-Path 直接炸）；要用 `-Command "& '<脚本绝对路径>' -BuildRoot '<目录>'"` 调用。
 
 ## 界面
 
-- 圆屏安全区由 [WatchUi](<app/src/main/java/cn/dsh/watch/WatchUi.java>) 的 `page()` 一处负责：按圆的内接矩形留边（左右 15%、上下 18%）。**整个滚动区都在圆内，可见内容天然安全**，页面不要自己再加边距。
+- 圆屏适配 v2 由 [WatchUi](<app/src/main/java/cn/dsh/watch/WatchUi.java>) 的 `page()` 一处负责：**滚动区满屏，静态留白极小**（圆屏左右 7%、上下 4.5%），边缘行的收束交给 `CurvedScrollView` 的缩放/淡出（仿 Wear OS ScalingLazyColumn：中心 45% 不动，靠边行约 84% 大小、55% 透明度）。不要再把内容压进「圆的内接矩形」——那样上下是黑边、两侧全浪费（v1 的教训）。新页面入场时 `render()` 会把首行下移到 8.5% 屏高，标题不落在淡出区。
 - **绝不要按控件自身的屏幕位置去动态调边距**。它形成布局反馈环——算边距 → 控件变窄 → 文字折行 → 位置变化 → 再算出不同边距，最终把同排按钮压成宽窄不一的窄条且无法拉伸。基础安全区已经足够。
 - 按钮用 `TextView` + 自绘背景实现（`WatchUi.button`），**不用 `android.widget.Button`**：后者带 9-patch 背景与固有最小宽度，在窄圆屏上会被顶住而撑不满整行。按钮必须单行显示，宽度交给父容器（`LayoutParams(-1, -2)`）。
 - 同排两个按钮用 `weighted()`（`weight=1` 平分）；**之后不要再改它们的 layoutParams 或加 margin**，那会破坏 weight 分配。
@@ -51,11 +53,18 @@
 
 - 横向手势在 `MainActivity.dispatchTouchEvent` 里判定，**不能**挂在页面根容器上——子层 `ScrollView` 会先消费触摸，左滑会被当成纵向滚动。
 - 判定要用**整个手势期间的最大位移**，不能只看抬手那一帧：注入的滑动常被拆成很多小步，逐帧看会漏判。门槛为横向 ≥44dp 且大于纵向的 1.2 倍。
-- 约定：**右滑返回上一级，左滑打开操作菜单**。方向必须一致——左滑是「把右侧的内容拉出来」，因此菜单面板**贴右边缘、从右滑入**（140ms 位移 + 淡入）；面板放左边会让人觉得手势反了。关闭用 150ms 反向动画，动画结束才移除视图并允许下一次打开。
-- 正文与工具结果都经 [Markdown](<app/src/main/java/cn/dsh/watch/Markdown.java>) 渲染：标题放大加粗、列表带圆点、行内代码等宽加底色、引用变灰、表格压成一行、代码块整体等宽。工具读出的 .md 文本因此能直接可读。
+- 约定：**右滑返回上一级，左滑打开操作菜单**。方向必须一致——左滑是「把右侧的内容拉出来」，因此菜单面板**贴右边缘、从右滑入**（140ms 位移 + 淡入）；面板放左边会让人觉得手势反了。关闭用 150ms 反向动画，动画结束才移除视图并允许下一次打开。**右滑到顶**（项目列表根页面）直接退出应用，带滑出动画（`exitApp`）。
+- **换页动画**：每个页面建好后设 `page.navTag`（如 `"session:"+id`、`"compose"`），`render()` 靠它区分「换页」与「自动刷新重绘」——只有标签变化才播入场动画（220ms 位移 + 淡入，DecelerateInterpolator(1.8)），方向由 `inferDirection` 按页面类别推断（进入浮层页=前进、回到会话/列表=返回），显式 `navForward()` / `navBack()` 可覆盖。自动刷新渲染的标签不变，**永远不播动画**，这是动画不干扰滚动保留的前提。
+- 正文与工具结果都经 [Markdown](<app/src/main/java/cn/dsh/watch/Markdown.java>) 渲染：标题放大加粗、列表带圆点、行内代码等宽加底色、引用变灰、表格压成一行、代码块整体等宽。工具读出的 .md 文本因此能直接可读。渲染入口在 `messageBubble`（助手消息），用户消息按原样显示；渲染异常时兜底为纯文本。消息气泡支持**长按复制**（`bubbleRich(..., copyText)`，复制 Markdown 原文）。
+- **视觉风格对齐 AA 深色主题**（中性 Zinc 色系，`WatchUi` 色块顶部有完整色表）：画布 `#09090B`、主操作按钮是**纯白胶囊**（`#FAFAFA` 底 + 黑字 + 暗波纹），次按钮深灰面板 + 细描边；助手消息**无气泡底色**铺在画布上，用户消息右侧深灰胶囊；链接/行内强调用金色 `#EBB353`。颜色只标状态（运行绿、等待琥珀、错误红、链接金），不标说话人。
+- **字号缩放**：`WatchUi.text()` 是所有文字的唯一出口，设置页的四档缩放（0.85/1.0/1.15/1.3）经 `setFontScale` 在这里一次生效；48dp 最小点击高度不随缩放变，大字号靠按钮自然增高。
+- **圆屏判定**：`page()` 用 `isScreenRound() || 近正方形(|w−h| ≤ max(4px, 3dp))`——不少全安卓圆表（454×454 的 1.39 寸屏）报告的是方形配置，只看 API 会按 8dp 方屏边距处理，四角被表圈切掉。
+- **界面设置页**（`showSettings`，列表/会话菜单的「界面设置」进入）：字号、会话刷新频率（2/4/8 秒，`sessionRefreshMs()` 取代旧常量）、进会话页默认「只看对话」、**提醒通知开关**（`Notify` 服务）；改动即时落盘生效，档位用「点一下换一档」的循环行。开关变化要同步启停服务（`startService` / `stopService`）。
+- **会话页底部操作栏是固定底栏**（`ui.bottomBar(page)`）：钉在屏幕底部不随内容滚动，内容列自动让出其高度；栏内按钮照常 `weighted()`。不要把操作栏 `ui.add` 进内容流——长对话里会滚出屏幕，找不到「更多」。
 - 工具调用按**正文分界**分组，不是按「相邻的工具步骤」：时间线里工具与正文平铺、中间几乎总隔着一条消息步骤，按相邻关系分组会让每次调用各自成组，折叠就失去意义。折叠分两级——点卡片列出连续调用的清单，点清单里某一条才看参数与结果；收组时连带清掉内部明细，下次打开是干净的清单。
 - **展开状态必须记在 `openGroups` / `openRows` 里**（工具组键 `groupKey`，行键 `groupKey#i`，思考块键 `think:<seq>`）。界面是重建整屏刷新，展开状态若只存在于视图上，会话页每 4 秒一次的刷新就会把用户刚点开的详情缩回去——这正是「点了展开却看不到内容」。还原直接设可见性、**不走动画**，否则整屏重建时每张卡片都闪一遍。
 - 收组监听器只挂标题与摘要两处，**不要挂整张卡片**：清单区域必须留给单条明细，否则「点这一条」被卡片抢走，变成把整组收起来。清单行整行可点（`rowBox`，`minHeight 48dp`）。
+- **提醒通知**（[Notify.java](<app/src/main/java/cn/dsh/watch/Notify.java>)，顶层 `Service`）：应用启动时若已配对且开关开启则 `startService`，`START_STICKY` + Handler 每 30 秒轮询；筛 `waiting/unread` 且非前台会话（`MainActivity.foregroundSessionId` 去重），拉 notices → `Api.parseNotices` → 未提醒过的发高优先级通知（渠道 `asks`），点开带 `session` extra 直达会话（`MainActivity.openPendingSession`）；问题处理完自动撤通知。Doze 深睡时跳过该轮。改轮询/去重逻辑不要破坏「只在新问题出现时震一次」（`seen` 键 = `会话:通知id`）。
 - 模型选择两级（模型 → 推理强度）：AA 目录没有供应商层级，Api 把整个目录包成一个名为「模型」的 `ProviderInfo` 以复用既有结构；显示时不要把它再拆成三级。当前值取「会话状态 selections → 目录 default」，不存在时不臆造模型名。
 - 长路径会占满圆屏，展示前一律经 `shortenPaths` / `shortPath` 压成最后一段。
 
@@ -69,7 +78,7 @@
 
 ## 发布
 
-- 仓库：[DING-HAO-RAN/dsh-watch](https://github.com/DING-HAO-RAN/dsh-watch)（上游，MIT）。本分支的产物名固定为 `AA手表.apk`（[README](<README.md>) 与之一致）。
+- 仓库：[DING-HAO-RAN/dsh-watch](https://github.com/DING-HAO-RAN/dsh-watch)（上游，MIT）。本分支的应用名是 **DSH Watch**（AndroidManifest 两处 label），产物名固定为 `DSH Watch.apk`（[README](<README.md>) 与之一致）。
 - 仓库用 **MIT 协议**（[LICENSE](<LICENSE/>)，版权署名用仓库标识 `DING-HAO-RAN`，不写个人姓名与邮箱）。改协议要同步三处：`LICENSE`、README 的许可段、`relay/package.json` 的 `license` 字段。
 - 成片与封面放在 `docs/`（**不进版本库**，`.gitignore` 已忽略）；投稿文案在 `docs/B站投稿文案.md`（进版本库）。简介正文距 B 站 2000 字上限留余量，再加内容先删同量的旧内容。
 - **画面不许用 CSS 动画**：逐帧截图时 CSS 动画不受控，同一 `t` 会截到不同画面。所有随时间变化的量都必须由 `t` 直接算出来。

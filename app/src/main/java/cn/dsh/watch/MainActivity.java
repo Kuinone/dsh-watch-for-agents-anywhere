@@ -2,15 +2,19 @@ package cn.dsh.watch;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -34,6 +38,17 @@ import java.util.List;
 public class MainActivity extends Activity {
     /** 会话消息的自动刷新间隔；手表上过于频繁会明显耗电。 */
     private static final long SESSION_REFRESH_MS = 4_000L;
+
+    /** 会话页自动刷新间隔：由设置页调整（2/4/8 秒）。 */
+    private long sessionRefreshMs() {
+        return store.refreshSeconds() * 1_000L;
+    }
+
+    /** 字号档位与刷新档位（设置页循环切换用）。 */
+    private static final float[] FONT_STEPS = {0.85f, 1.0f, 1.15f, 1.3f};
+    private static final String[] FONT_LABELS = {"小", "标准", "大", "特大"};
+    private static final int[] REFRESH_STEPS = {2, 4, 8};
+    private static final String[] REFRESH_LABELS = {"快（2 秒）", "标准（4 秒）", "省电（8 秒）"};
     /** 会话列表的自动刷新间隔。 */
     private static final long LIST_REFRESH_MS = 10_000L;
 
@@ -65,6 +80,13 @@ public class MainActivity extends Activity {
     private String currentSessionTitle = "";
     private Api.Ask currentAsk;
     private boolean currentRunning;
+    /** 当前会话是否已接管（false 时只读，发消息/切模型前要先开启）。 */
+    private boolean currentSessionTakeover;
+    /**
+     * 开启接管后待发送的消息：在只读会话里点发送时，先走接管确认页，
+     * 确认成功后自动把这排消息发出去。
+     */
+    private String pendingComposeText;
     private boolean loadingSession;
 
     private boolean onSessionPage;
@@ -98,7 +120,7 @@ public class MainActivity extends Activity {
             if (currentSessionId.isEmpty()) return;
             // 正在输入、或用户刚滑过，就跳过本次刷新，避免重建把界面顶掉。
             if (!editing && !recentlyTouched()) loadSession(currentSessionId, true);
-            refresh.postDelayed(this, SESSION_REFRESH_MS);
+            refresh.postDelayed(this, sessionRefreshMs());
         }
     };
     private final Runnable listTicker = new Runnable() {
@@ -160,6 +182,8 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         ui = new WatchUi(this);
         store = new Store(this);
+        // 界面字号缩放来自设置页的持久化配置。
+        ui.setFontScale(store.fontScale());
         api = new Api();
         api.bind(store);
         // 允许从外部带入登录信息（例如电脑端生成一条命令让手表直接登录），
@@ -170,10 +194,16 @@ public class MainActivity extends Activity {
             showConnect();
             return;
         }
+        // 提醒通知服务：AI 提问/审批时在表盘上提醒（见 Notify；应用在前台时自动去重）。
+        if (store.notifyEnabled() && store.paired()) {
+            startService(new Intent(this, Notify.class));
+        }
         if (store.paired()) {
             currentSessionId = store.lastSession();
             if (currentSessionId.isEmpty()) showSessionList();
             else showSession(currentSessionId);
+            // 通知点进来直接跳到对应会话（比「先回列表再找」顺手）。
+            openPendingSession();
         } else {
             showConnect();
         }
@@ -190,7 +220,11 @@ public class MainActivity extends Activity {
         super.onNewIntent(intent);
         setIntent(intent);
         applyIntentExtras(intent);
-        if (hasPendingLogin()) showConnect();
+        if (hasPendingLogin()) {
+            showConnect();
+            return;
+        }
+        openPendingSession();
     }
 
     /** 当前是否有待用的登录参数（服务器、邮箱、密码都齐）。 */
@@ -212,9 +246,27 @@ public class MainActivity extends Activity {
         if (server != null && !server.trim().isEmpty()) pendingServer = server.trim();
         if (email != null && !email.trim().isEmpty()) pendingEmail = email.trim();
         if (password != null && !password.isEmpty()) pendingPassword = password;
+        // 通知点入带会话 id：进入应用后直接跳到该会话。
+        String session = intent.getStringExtra("session");
+        if (session != null && !session.trim().isEmpty()) pendingOpenSession = session.trim();
         if (intent.getBooleanExtra("autologin", false) && hasPendingLogin()) {
             autoLogin = true;
         }
+    }
+
+    /**
+     * 若有待跳转的会话（通知点入），直接打开它。
+     * 已在该会话页时跳过，避免刷新把用户的滚动位置重置。
+     */
+    private void openPendingSession() {
+        if (pendingOpenSession.isEmpty() || !store.paired()) return;
+        if (pendingOpenSession.equals(currentSessionId) && onSessionPage) {
+            pendingOpenSession = "";
+            return;
+        }
+        String sessionId = pendingOpenSession;
+        pendingOpenSession = "";
+        showSession(sessionId);
     }
 
     /** 延迟执行（自动登录需要等界面挂上以后再发请求）。 */
@@ -234,6 +286,10 @@ public class MainActivity extends Activity {
     private boolean autoLogin = false;
     /** 是否把密码记在本机（静默重登依赖它；关掉后令牌过期就要手动重登）。 */
     private boolean rememberPassword = true;
+    /** 通知点入要跳转的会话（见 applyIntentExtras / openPendingSession）。 */
+    private String pendingOpenSession = "";
+    /** 当前前台正在看的会话（通知服务用它去重：正看着的会话不再弹通知）。 */
+    static volatile String foregroundSessionId = "";
 
     /** 手表上弹一个短提示（没有 Toast 时降级为日志）。 */
     private void showToast(String message) {
@@ -250,22 +306,185 @@ public class MainActivity extends Activity {
      * 重建整屏会丢掉滚动位置，而会话页与会话列表都会定时自动刷新——不保留的话
      * 用户根本没法往下翻（列表有几十条，翻一屏就被弹回顶部）。因此这里默认记住
      * 旧页面的滚动位置并还原；确实需要回到顶部时调用 {@link #resetScroll()}。
+     *
+     * 动画：通过 {@link Page#navTag} 判断「换页」——自动刷新渲染的是同一个标签，
+     * 不播动画；真正的导航（前进/返回）才播入场动画。方向优先用 {@link #pendingNav}
+     * 显式指定的（返回时从左滑入），否则默认从右滑入（前进的手感）。
      */
     private void render(WatchUi.Page page) {
-        currentPage = page;
         if (gesture == null) {
             gesture = new WatchUi.HorizontalGesture(getResources().getDisplayMetrics().density);
         }
         int restore = resetScrollOnNextRender ? 0 : currentScroll();
         resetScrollOnNextRender = false;
-        setContentView(page.root);
+        // 换页判定：标签变了才算导航。第一次渲染（启动）不播动画。
+        boolean navigate = currentNavTag != null && !currentNavTag.equals(page.navTag);
+        String previousTag = currentNavTag;
+        int direction = pendingNav != 0 ? pendingNav : (navigate ? inferDirection(previousTag, page.navTag) : 0);
+        pendingNav = 0;
+
+        // 换页前收掉残留的菜单浮层（不播关闭动画——马上要换页了）。浮层视图
+        // 由下面的替换清理统一移走，这里只复位状态。
+        if (menuOpen) {
+            menuOpen = false;
+            menuBackdrop = null;
+            menuWrapper = null;
+            editing = false;
+        }
+
+        WatchUi.Page previous = currentPage;
+        currentPage = page;
+
+        /**
+         * 层叠替换（不再用 setContentView）。
+         *
+         * setContentView 会先清空窗口再挂新页，中间露出一帧窗口背景——这就是
+         * 「换页闪」，定时刷新同样中招。改成在同一窗口里先把新页叠上去、同帧
+         * 移除旧页和一切残层（菜单、上一页的快照），窗口任何时刻都有内容。
+         */
+        ViewGroup content = (ViewGroup) findViewById(android.R.id.content);
+
+        // 旧页快照铺底：一般应用的转场是「新页滑入盖住旧页」。快照让旧页在
+        // 新页滑入期间保持静止可见，视觉连续；动画结束即移除并回收。
+        boolean animate = direction != 0 && !pendingScrollToBottom
+                && previous != null
+                && previous.root.getWidth() > 0 && previous.root.getHeight() > 0;
+        ImageView ghost = null;
+        Bitmap shot = null;
+        if (animate) {
+            try {
+                shot = Bitmap.createBitmap(previous.root.getWidth(),
+                        previous.root.getHeight(), Bitmap.Config.ARGB_8888);
+                previous.root.draw(new Canvas(shot));
+                ghost = new ImageView(this);
+                ghost.setImageBitmap(shot);
+                content.addView(ghost, new FrameLayout.LayoutParams(-1, -1));
+            } catch (Throwable ignored) {
+                ghost = null;
+                shot = null;
+            }
+        }
+
+        content.addView(page.root, new FrameLayout.LayoutParams(-1, -1));
+        for (int i = content.getChildCount() - 1; i >= 0; i--) {
+            View child = content.getChildAt(i);
+            if (child != page.root && child != ghost) content.removeViewAt(i);
+        }
+
+        if (animate && ghost != null) {
+            // 入场：新页从侧面滑入 + 淡入，盖在静止的旧页快照上（Activity 转场
+            // 的样子）。滑入没盖住的部分透出的正是旧页，不存在空帧。
+            float travel = getResources().getDisplayMetrics().widthPixels * 0.45f;
+            View root = page.root;
+            root.setTranslationX(direction > 0 ? travel : -travel);
+            root.setAlpha(0f);
+            final ImageView ghostView = ghost;
+            final Bitmap ghostShot = shot;
+            root.animate().translationX(0f).alpha(1f)
+                    .setDuration(220)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator(1.8f))
+                    .withEndAction(() -> {
+                        content.removeView(ghostView);
+                        if (ghostShot != null) ghostShot.recycle();
+                    })
+                    .start();
+            // 初始下移（ScalingLazyColumn 惯例）：新页面首行从「略过边缘」的位置
+            // 开始，标题不落在曲面淡出区。短内容会被滚动范围钳回 0。
+            final WatchUi.Page landing = page;
+            landing.scroll.post(() -> landing.scroll.post(() -> {
+                if (landing.scroll.getScrollY() == 0 && landing.scroll.getHeight() > 0) {
+                    landing.scroll.scrollTo(0, Math.round(landing.scroll.getHeight() * 0.085f));
+                }
+            }));
+        }
         if (pendingScrollToBottom) {
             pendingScrollToBottom = false;
-            // 等布局完成再滚，否则内容高度还是 0、滚不到底。
-            page.scroll.post(() -> page.scroll.post(page::scrollToBottom));
+            // 三连 post：等布局完成、且固定底栏的让位 padding（下一帧才补上）
+            // 都生效后再滚，否则最后一屏会被底栏盖住，看起来像「没到底」。
+            page.scroll.post(() -> page.scroll.post(() -> page.scroll.post(page::scrollToBottom)));
             return;
         }
         page.scroll.post(() -> page.scroll.scrollTo(0, restore));
+    }
+
+    /** 当前页面的导航标签（换页判定用，见 render）。 */
+    private String currentNavTag;
+    /** 下一次渲染的动画方向：1 前进（从右滑入）、-1 返回（从左滑入）、0 自动。 */
+    private int pendingNav;
+
+    /**
+     * 换页方向推断：进入浮层页（发消息、答题、模型、接管确认、设置、登录、新建
+     * 会话……）是「前进」，回到会话或列表是「返回」。显式 navForward/navBack
+     * 优先于此推断，推断不出来的换页一律按前进处理（视觉上仍然平滑）。
+     */
+    private static final String[] OVERLAY_TAG_PREFIXES =
+            {"compose", "ask", "model", "takeover", "settings", "connect", "new-session"};
+
+    private static int inferDirection(String from, String to) {
+        if (from == null || to == null || from.equals(to)) return 0;
+        boolean fromOverlay = isOverlayTag(from);
+        boolean toOverlay = isOverlayTag(to);
+        if (toOverlay && !fromOverlay) return 1;
+        if (!toOverlay && fromOverlay) return -1;
+        if (to.equals("projects") && from.equals("sessions-list")) return -1;
+        return 1;
+    }
+
+    private static boolean isOverlayTag(String tag) {
+        for (String prefix : OVERLAY_TAG_PREFIXES) {
+            if (tag.startsWith(prefix)) return true;
+        }
+        return false;
+    }
+
+    /** 标记下一次渲染为「前进」导航。 */
+    private void navForward() {
+        pendingNav = 1;
+    }
+
+    /** 标记下一次渲染为「返回」导航。 */
+    private void navBack() {
+        pendingNav = -1;
+    }
+
+    /** 上一次项目列表页右滑的时间（2.5 秒内连滑两次才退出应用）。 */
+    private long lastExitSwipe;
+
+    /**
+     * 退出应用：当前页向右滑出并淡出，动画结束后真正退出。
+     *
+     * 两个防闪的关键：
+     * 1. 摘掉定时刷新——动画进行中若整页被重建（setContentView 换掉正在动画的
+     *    根视图），看起来就是「闪一下、没有动画」；
+     * 2. 在滑出的根视图底下垫一层画布同色底——根视图飞走后露出的是主题窗口
+     *    背景（不是画布色），不垫底会闪白/闪黑；finish 时再关掉系统转场，
+     *    避免自绘滑出之后又叠一段系统默认的滑动动画。
+     */
+    private void exitApp() {
+        if (currentPage == null || destroyed) {
+            finishAndRemoveTask();
+            return;
+        }
+        refresh.removeCallbacks(sessionTicker);
+        refresh.removeCallbacks(listTicker);
+        editing = false;
+        View root = currentPage.root;
+        if (root.getParent() instanceof ViewGroup) {
+            View backdrop = new View(this);
+            backdrop.setBackgroundColor(WatchUi.BG);
+            ((ViewGroup) root.getParent()).addView(backdrop, 0,
+                    new ViewGroup.LayoutParams(-1, -1));
+        }
+        float travel = getResources().getDisplayMetrics().widthPixels;
+        root.animate().translationX(travel).alpha(0f)
+                .setDuration(240)
+                .setInterpolator(new android.view.animation.AccelerateInterpolator(1.6f))
+                .withEndAction(() -> {
+                    if (destroyed) return;
+                    finishAndRemoveTask();
+                    overridePendingTransition(0, 0);
+                })
+                .start();
     }
 
     /** 下一次渲染后滚到底部（进入会话时用，便于直接看到最新结果）。 */
@@ -301,6 +520,111 @@ public class MainActivity extends Activity {
         return 0;
     }
 
+    // ---------------------------------------------------------- 界面设置
+
+    /**
+     * 界面设置页。
+     *
+     * 字号 / 刷新频率用「点一下换一档」的循环选择——手表上塞滑杆太挤，
+     * 循环行一眼能看出当前档位，也是 Wear OS 常见的做法。改动即时保存并生效。
+     * 从会话页左滑菜单的「界面设置」进入，返回按钮回到来路。
+     */
+    private void showSettings() {
+        onSessionPage = false;
+        editing = false;
+        WatchUi.Page page = ui.page();
+        page.navTag = "settings";
+        ui.heading(page, "界面设置", accountDisplayName());
+
+        // ---- 字号 ----
+        int fontIndex = nearestIndex(store.fontScale(), FONT_STEPS);
+        ui.add(page, ui.row("字号", "当前：" + FONT_LABELS[fontIndex] + "（点一下换一档）", () -> {
+            float next = FONT_STEPS[(fontIndex + 1) % FONT_STEPS.length];
+            store.setFontScale(next);
+            ui.setFontScale(next);
+            showToast("字号：" + FONT_LABELS[(fontIndex + 1) % FONT_STEPS.length]);
+            showSettings();
+        }), 0, 4);
+
+        // ---- 会话刷新频率 ----
+        int refreshIndex = nearestIndex(store.refreshSeconds(), REFRESH_STEPS);
+        ui.add(page, ui.row("会话刷新", "当前：" + REFRESH_LABELS[refreshIndex], () -> {
+            int next = REFRESH_STEPS[(refreshIndex + 1) % REFRESH_STEPS.length];
+            store.setRefreshSeconds(next);
+            showToast(REFRESH_LABELS[(refreshIndex + 1) % REFRESH_STEPS.length]);
+            showSettings();
+        }), 0, 4);
+
+        // ---- 进会话页默认「只看对话」 ----
+        boolean only = store.onlyConversationDefault();
+        ui.add(page, ui.row("默认只看对话", only ? "进会话页隐藏工具与思考" : "进会话页显示全部步骤", () -> {
+            store.setOnlyConversationDefault(!only);
+            showToast(!only ? "进会话默认只看对话" : "进会话显示全部步骤");
+            showSettings();
+        }), 0, 4);
+
+        // ---- 提醒通知 ----
+        boolean notify = store.notifyEnabled();
+        ui.add(page, ui.row("提醒通知", notify ? "AI 提问/审批时震动提醒（约每 30 秒检查）" : "已关闭，只在应用里看得到", () -> {
+            store.setNotifyEnabled(!notify);
+            showToast(!notify ? "已开启提醒通知" : "已关闭提醒通知");
+            if (!notify) {
+                startService(new Intent(this, Notify.class));
+            } else {
+                stopService(new Intent(this, Notify.class));
+            }
+            showSettings();
+        }), 0, 4);
+
+        ui.divider(page);
+
+        // ---- 关于 ----
+        LinearLayout about = ui.card();
+        about.addView(ui.text("DSH Watch · 1.2", 12, WatchUi.FG));
+        TextView detail = ui.text("Agents Anywhere 云客户端\n服务器：" + store.base(), 10, WatchUi.MUTED);
+        detail.setPadding(0, ui.dp(4), 0, 0);
+        about.addView(detail);
+        ui.add(page, about, 0, 8);
+
+        ui.add(page, ui.button(currentSessionId.isEmpty() || !store.paired()
+                ? "返回列表" : "返回会话", false, () -> {
+            if (currentSessionId.isEmpty() || !store.paired()) showSessionList();
+            else showSession(currentSessionId);
+        }), 0, 0);
+        page.setOnSwipeRight(() -> {
+            if (currentSessionId.isEmpty() || !store.paired()) showSessionList();
+            else showSession(currentSessionId);
+        });
+        render(page);
+    }
+
+    /** 在升序档位数组里找最接近 value 的下标（设置页回显用）。 */
+    private static int nearestIndex(float value, float[] steps) {
+        int best = 0;
+        float bestDelta = Float.MAX_VALUE;
+        for (int i = 0; i < steps.length; i++) {
+            float delta = Math.abs(steps[i] - value);
+            if (delta < bestDelta) {
+                bestDelta = delta;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    private static int nearestIndex(int value, int[] steps) {
+        int best = 0;
+        int bestDelta = Integer.MAX_VALUE;
+        for (int i = 0; i < steps.length; i++) {
+            int delta = Math.abs(steps[i] - value);
+            if (delta < bestDelta) {
+                bestDelta = delta;
+                best = i;
+            }
+        }
+        return best;
+    }
+
     // ---------------------------------------------------------- 登录页
 
     /**
@@ -313,11 +637,12 @@ public class MainActivity extends Activity {
     private void showConnect() {
         onSessionPage = false;
         WatchUi.Page page = ui.page();
+        page.navTag = "connect";
         ui.heading(page, "账号", store.paired() ? "已登录" : "登录 Agents Anywhere");
 
         if (store.paired()) {
             LinearLayout current = ui.card();
-            current.addView(ui.text("当前账号", 11, WatchUi.ACCENT));
+            current.addView(ui.text("当前账号", 11, WatchUi.MUTED));
             TextView name = ui.text(accountDisplayName(), 13, WatchUi.FG);
             name.setPadding(0, ui.dp(5), 0, 0);
             current.addView(name);
@@ -524,6 +849,8 @@ public class MainActivity extends Activity {
         currentAsk = null;
         currentNotices.clear();
         currentRunning = false;
+        currentSessionTakeover = false;
+        pendingComposeText = null;
         currentOldestOrderSeq = 0;
         lastSeq = 0;
         currentHasMore = false;
@@ -579,18 +906,30 @@ public class MainActivity extends Activity {
     /** 只渲染当前列表页，不发请求、不安排定时器。 */
     private void renderSessionListPage() {
         WatchUi.Page page = ui.page();
+        page.navTag = currentProjectId.isEmpty() ? "projects" : "sessions-list";
         if (currentProjectId.isEmpty()) {
             renderProjectList(page);
         } else {
             renderProjectSessions(page);
         }
-        // 手势：在会话列表里右滑回到项目列表，左滑打开操作菜单。
+        // 手势：项目列表页右滑 = 退出应用，但**连滑两次才真的退出**（一般应用的
+        // 「再按一次退出」惯例）——单滑只提示，防止从会话一路滑回列表时顺手
+        // 把应用滑没了。项目内的会话列表右滑回到项目列表；左滑打开操作菜单。
         page.setOnSwipeRight(() -> {
             if (!currentProjectId.isEmpty()) {
+                navBack();
                 currentProject = "";
                 currentProjectId = "";
                 resetScroll();
                 showSessionList();
+                return;
+            }
+            long now = android.os.SystemClock.uptimeMillis();
+            if (now - lastExitSwipe < 2500) {
+                exitApp();
+            } else {
+                lastExitSwipe = now;
+                showToast("再滑一次退出");
             }
         });
         page.setOnSwipeLeft(() -> showActionMenu(menuForProjects()));
@@ -741,6 +1080,7 @@ public class MainActivity extends Activity {
     private void showListError(String error) {
         onSessionPage = false;
         WatchUi.Page page = ui.page();
+        page.navTag = "list-error";
         ui.heading(page, "连不上服务器", "");
         ui.add(page, ui.text(error, 13, WatchUi.DANGER), 0, 12);
         ui.add(page, ui.text("服务器：" + store.base(), 11, WatchUi.MUTED), 0, 12);
@@ -846,6 +1186,7 @@ public class MainActivity extends Activity {
         onSessionPage = false;
         editing = false;
         WatchUi.Page page = ui.page();
+        page.navTag = "new-session";
         ui.heading(page, "新建会话", "第 1 步 · 选项目");
         if (projects.isEmpty()) {
             ui.add(page, ui.text("服务器上还没有项目。请先在网页端或电脑端创建一个项目，再回来新建会话。", 12, WatchUi.MUTED), 0, 12);
@@ -865,6 +1206,7 @@ public class MainActivity extends Activity {
         onSessionPage = true;
         editing = true;
         WatchUi.Page page = ui.page();
+        page.navTag = "new-session-compose";
         ui.heading(page, "新会话", clipLine(project.project, 16));
         final EditText input = new EditText(this);
         input.setHint("想先让 Agent 做什么？");
@@ -906,6 +1248,7 @@ public class MainActivity extends Activity {
         if (project == null || content.isEmpty()) return;
         editing = false;
         WatchUi.Page page = ui.page();
+        page.navTag = "new-session-sending";
         ui.heading(page, "正在创建…", clipLine(project.project, 16));
         ui.add(page, ui.text("正在连接运行时并创建会话，最长可能要等一分钟…", 12, WatchUi.MUTED), 0, 8);
         ui.add(page, ui.button("返回列表", false, this::showSessionList), 0, 0);
@@ -972,6 +1315,7 @@ public class MainActivity extends Activity {
         chosenProject = null;
         onSessionPage = false;
         WatchUi.Page page = ui.page();
+        page.navTag = "new-session-error";
         ui.heading(page, "新建失败", "");
         ui.add(page, ui.text(error, 13, WatchUi.DANGER), 0, 12);
         ui.add(page, ui.button("重选项目", true, this::createSession), 0, 8);
@@ -988,6 +1332,11 @@ public class MainActivity extends Activity {
         editing = false;
         currentSessionId = sessionId;
         currentSessionTitle = titleOf(sessionId);
+        Api.Session known = findSession(sessionId);
+        // 接管状态先从列表快照里取（列表接口有这个字段），快照回来后再校正。
+        currentSessionTakeover = known != null && known.takeover;
+        // 「只看对话」默认值来自设置页；进会话时套用一次。
+        showAllSteps = !store.onlyConversationDefault();
         currentAsk = null;
         currentNotices.clear();
         currentRunning = false;
@@ -998,12 +1347,13 @@ public class MainActivity extends Activity {
         customAnswers.clear();
         store.setLastSession(sessionId, currentSessionTitle);
         autoScrollToBottom = true;
+        foregroundSessionId = sessionId;
         refresh.removeCallbacks(sessionTicker);
         renderSession("正在载入…");
         // 进会话即清未读；结果无所谓。
         api.markRead(sessionId);
         loadSession(sessionId, false);
-        refresh.postDelayed(sessionTicker, SESSION_REFRESH_MS);
+        refresh.postDelayed(sessionTicker, sessionRefreshMs());
     }
 
     /** 从会话列表里找会话标题；列表未载入时退回上次记住的标题。 */
@@ -1016,6 +1366,14 @@ public class MainActivity extends Activity {
             if (!stored.isEmpty()) return stored;
         }
         return "会话";
+    }
+
+    /** 从会话列表里找会话对象；找不到返回 null。 */
+    private Api.Session findSession(String sessionId) {
+        for (Api.Session session : sessions) {
+            if (session.id.equals(sessionId)) return session;
+        }
+        return null;
     }
 
     /**
@@ -1053,6 +1411,10 @@ public class MainActivity extends Activity {
         if (!title.isEmpty()) {
             currentSessionTitle = title;
             store.setLastSession(sessionId, title);
+        }
+        // 快照的 session 对象里有实时的接管状态（列表接口的可能是旧值）。
+        if (session != null && session.has("takeover")) {
+            currentSessionTakeover = session.optBoolean("takeover", false);
         }
         JSONObject state = root.optJSONObject("state");
         if (state == null) state = root;
@@ -1251,6 +1613,8 @@ public class MainActivity extends Activity {
         if (choice != null && !choice.model.isEmpty()) {
             builder.append(" · ").append(shortModel(choice.model));
         }
+        // 只读时标出来，配合下方的一键接管按钮。
+        if (!currentSessionTakeover) builder.append(" · 只读");
         return builder.toString();
     }
 
@@ -1258,6 +1622,7 @@ public class MainActivity extends Activity {
     private void renderSessionError(String error) {
         onSessionPage = true;
         WatchUi.Page page = ui.page();
+        page.navTag = "session:" + currentSessionId;
         ui.heading(page, currentSessionTitle.isEmpty() ? "会话" : currentSessionTitle, "载入失败");
         ui.add(page, ui.text(error, 13, WatchUi.DANGER), 0, 12);
         ui.add(page, ui.button("重试", true, () -> loadSession(currentSessionId, false)), 0, 8);
@@ -1279,10 +1644,15 @@ public class MainActivity extends Activity {
     private void renderSession(String banner) {
         onSessionPage = true;
         WatchUi.Page page = ui.page();
+        page.navTag = "session:" + currentSessionId;
         ui.heading(page, currentSessionTitle.isEmpty() ? "会话" : currentSessionTitle,
                 sessionSubtitle());
         if (banner != null && !banner.isEmpty()) {
-            ui.add(page, ui.text(banner, 11, WatchUi.ACCENT), 0, 6);
+            ui.add(page, ui.text(banner, 11, WatchUi.TEAL), 0, 6);
+        }
+        // 只读会话给一条常驻提示：一眼知道为什么发不了消息，点一下就能开接管。
+        if (!currentSessionTakeover && currentAsk == null) {
+            ui.add(page, ui.button("只读模式 · 点此开启接管", false, this::confirmEnableTakeover), 0, 6);
         }
         // 待答问题卡片放在内容最上面，扫一眼就能看到。
         if (currentAsk != null) {
@@ -1292,17 +1662,17 @@ public class MainActivity extends Activity {
         contentArea.setOrientation(LinearLayout.VERTICAL);
         ui.add(page, contentArea, 0, 0);
         fillContent();
-        LinearLayout bottom = new LinearLayout(this);
-        bottom.setOrientation(LinearLayout.HORIZONTAL);
+        // 底部三键栏：固定在屏幕底部（不随内容滚动，长对话里随时能按）；
+        // 发消息常驻；运行中给停止（运行时不能切模型），空闲给模型；
+        // 其余入口全收进「更多」菜单。
+        LinearLayout bottom = ui.bottomBar(page);
         bottom.addView(weighted(ui.button("发消息", true, this::showCompose)));
-        if (currentAsk != null) {
-            bottom.addView(weighted(ui.button("回答", false, () -> showQuestion(currentAsk))));
-        } else if (currentRunning) {
+        if (currentRunning) {
             bottom.addView(weighted(ui.button("停止", false, this::cancelRun)));
         } else {
-            bottom.addView(weighted(ui.button("刷新", false, () -> loadSession(currentSessionId, false))));
+            bottom.addView(weighted(ui.button("模型", false, this::showModelPicker)));
         }
-        ui.add(page, bottom, 8, 0);
+        bottom.addView(weighted(ui.button("更多", false, () -> showActionMenu(menuForSession()))));
         page.setOnSwipeLeft(() -> showActionMenu(menuForSession()));
         page.setOnSwipeRight(this::backToList);
         render(page);
@@ -1322,6 +1692,96 @@ public class MainActivity extends Activity {
             showToast("已请求停止");
             loadSession(currentSessionId, false);
         });
+    }
+
+    // ------------------------------------------------------------ 接管
+
+    /**
+     * 接管确认页。
+     *
+     * AA 的会话默认只读：发消息、切模型都会被服务器拒绝（"session is read-only
+     * until takeover is enabled"）。开启接管是持久状态，官方客户端在开启前会
+     * 弹说明确认，这里同样确认一次，并把「确认后继续发送」串在同一条路径里。
+     */
+    private void confirmEnableTakeover() {
+        if (currentSessionId.isEmpty()) return;
+        editing = true;
+        boolean willSend = pendingComposeText != null && !pendingComposeText.isEmpty();
+        WatchUi.Page page = ui.page();
+        page.navTag = "takeover-on";
+        ui.heading(page, "开启接管？", clipLine(currentSessionTitle, 16));
+        ui.add(page, ui.text(
+                "开启后可以给这个会话发消息、切换模型。\n\n"
+                        + "注意：如果手机或网页正开着这个会话，新消息可能不会立刻出现在那边，重启它们即可同步。",
+                12, WatchUi.MUTED), 4, 8);
+        ui.add(page, ui.button(willSend ? "开启并发送" : "开启接管", true, this::enableTakeoverNow), 0, 6);
+        ui.add(page, ui.button("取消", false, () -> {
+            pendingComposeText = null;
+            editing = false;
+            renderSession("");
+        }), 0, 0);
+        page.setOnSwipeRight(() -> {
+            pendingComposeText = null;
+            editing = false;
+            renderSession("");
+        });
+        render(page);
+    }
+
+    /** 确认后真正开启接管；带着待发消息时自动接着发送。 */
+    private void enableTakeoverNow() {
+        final String sessionId = currentSessionId;
+        if (sessionId.isEmpty()) return;
+        renderSession("正在开启接管…");
+        api.enableTakeover(sessionId, result -> {
+            if (destroyed) return;
+            if (!result.ok) {
+                renderSession("开启失败：" + result.error);
+                return;
+            }
+            currentSessionTakeover = true;
+            showToast("已开启接管");
+            if (pendingComposeText != null && !pendingComposeText.isEmpty()) {
+                String text = pendingComposeText;
+                pendingComposeText = null;
+                sendMessage(text);
+            } else {
+                loadSession(sessionId, false);
+            }
+        });
+    }
+
+    /** 关闭接管（回到只读）确认页。 */
+    private void confirmDisableTakeover() {
+        if (currentSessionId.isEmpty()) return;
+        editing = true;
+        WatchUi.Page page = ui.page();
+        page.navTag = "takeover-off";
+        ui.heading(page, "关闭接管？", clipLine(currentSessionTitle, 16));
+        ui.add(page, ui.text("关闭后会话回到只读，不能再发消息，直到重新开启接管。", 12, WatchUi.MUTED), 4, 8);
+        ui.add(page, ui.button("关闭接管", true, () -> {
+            final String sessionId = currentSessionId;
+            renderSession("正在关闭接管…");
+            api.disableTakeover(sessionId, result -> {
+                if (destroyed) return;
+                if (!result.ok) {
+                    renderSession("关闭失败：" + result.error);
+                    return;
+                }
+                currentSessionTakeover = false;
+                showToast("已关闭接管");
+                loadSession(sessionId, false);
+            });
+        }), 0, 6);
+        ui.add(page, ui.button("取消", false, () -> {
+            editing = false;
+            renderSession("");
+        }), 0, 0);
+        page.setOnSwipeRight(() -> {
+            editing = false;
+            renderSession("");
+        });
+        render(page);
     }
 
     // ------------------------------------------------------------ 操作菜单
@@ -1347,6 +1807,9 @@ public class MainActivity extends Activity {
         if (currentRunning) {
             items.add(new MenuItem("停止生成", "打断当前回复", this::cancelRun));
         }
+        items.add(new MenuItem(currentSessionTakeover ? "关闭接管" : "开启接管",
+                currentSessionTakeover ? "会话回到只读，不能再发消息" : "允许发消息与切换模型",
+                currentSessionTakeover ? this::confirmDisableTakeover : this::confirmEnableTakeover));
         items.add(new MenuItem(showAllSteps ? "只看对话" : "显示全部步骤",
                 showAllSteps ? "隐藏工具与思考卡片" : "恢复工具与思考卡片", () -> {
             showAllSteps = !showAllSteps;
@@ -1363,7 +1826,8 @@ public class MainActivity extends Activity {
                 sessionScroll.post(() -> sessionScroll.fullScroll(View.FOCUS_DOWN));
             }
         }));
-        items.add(new MenuItem("设置", "账号与服务器", this::showConnect));
+        items.add(new MenuItem("界面设置", "字号 · 刷新频率", this::showSettings));
+        items.add(new MenuItem("账号与服务器", store.email(), this::showConnect));
         items.add(new MenuItem("返回项目", "", this::backToList));
         return items;
     }
@@ -1388,7 +1852,8 @@ public class MainActivity extends Activity {
             }));
         }
         items.add(new MenuItem("刷新", "重新拉取列表", this::showSessionList));
-        items.add(new MenuItem("设置", "账号与服务器", this::showConnect));
+        items.add(new MenuItem("界面设置", "字号 · 刷新频率", this::showSettings));
+        items.add(new MenuItem("账号与服务器", store.email(), this::showConnect));
         items.add(new MenuItem("退出登录", "清除令牌，重新登录", this::disconnect));
         return items;
     }
@@ -1553,7 +2018,7 @@ public class MainActivity extends Activity {
         final TextView head = ui.text(expanded ? "思考 ▾" : "思考 ▸", 12, WatchUi.MUTED);
         head.setPadding(ui.dp(10), ui.dp(8), ui.dp(10), ui.dp(8));
         box.addView(head);
-        final View body = ui.bubbleRich(step.thinking, false);
+        final View body = ui.bubbleRich(step.thinking, false, step.thinking);
         body.setPadding(ui.dp(4), 0, ui.dp(4), ui.dp(10));
         body.setVisibility(expanded ? View.VISIBLE : View.GONE);
         box.addView(body);
@@ -1572,7 +2037,7 @@ public class MainActivity extends Activity {
         ui.addTo(container, box, 0, 6);
     }
 
-    /** 用户 / 助手消息气泡（Markdown 渲染，超长截断）。 */
+    /** 用户 / 助手消息：助手侧经 Markdown 渲染，长按复制原文。 */
     private void messageBubble(LinearLayout container, Api.Step step) {
         String body = step.text == null ? "" : step.text.trim();
         if (!step.files.isEmpty()) {
@@ -1581,10 +2046,25 @@ public class MainActivity extends Activity {
             body = builder.toString();
         }
         if (body.isEmpty()) return;
+        boolean truncated = false;
         if (body.length() > 2400) {
-            body = body.substring(0, 2400) + "\n…（内容过长，已截断）";
+            body = body.substring(0, 2400);
+            truncated = true;
         }
-        ui.addTo(container, ui.bubbleRich(body, "user".equals(step.role)), 0, 6);
+        CharSequence display;
+        if ("user".equals(step.role)) {
+            // 用户消息按原样显示（用户输入的井号不是标题）。
+            display = truncated ? body + "\n…（内容过长，已截断）" : body;
+        } else {
+            // 助手消息走 Markdown：标题、列表、行内代码、代码块、链接。
+            CharSequence rendered = Markdown.render(body, WatchUi.FG, WatchUi.LINK,
+                    WatchUi.MUTED, 0xFF27272A);
+            display = truncated
+                    ? new android.text.SpannableStringBuilder(rendered)
+                            .append("\n…（内容过长，已截断）")
+                    : rendered;
+        }
+        ui.addTo(container, ui.bubbleRich(display, "user".equals(step.role), body), 0, 6);
     }
 
     private static String join(List<String> values, String separator) {
@@ -1735,14 +2215,13 @@ public class MainActivity extends Activity {
         return WatchUi.MUTED;
     }
 
-    /** 只看对话模式：仅渲染 message 步骤。 */
+    /** 只看对话模式：仅渲染 message 步骤（与完整模式同一渲染路径）。 */
     private void renderMessagesOnly(LinearLayout container) {
         int shown = 0;
         for (Api.Step step : steps) {
             if (!"message".equals(step.kind)) continue;
-            String body = step.text == null ? "" : step.text.trim();
-            if (body.isEmpty()) continue;
-            ui.addTo(container, ui.bubbleRich(body, "user".equals(step.role)), 0, 6);
+            if (step.text == null || step.text.trim().isEmpty()) continue;
+            messageBubble(container, step);
             shown++;
         }
         if (shown == 0) {
@@ -1783,11 +2262,13 @@ public class MainActivity extends Activity {
         });
     }
 
-    /** 从会话页返回列表。 */
+    /** 从会话页返回列表（返回动画：新页从左滑入）。 */
     private void backToList() {
+        navBack();
         returningFromSession = true;
         onSessionPage = false;
         currentSessionId = "";
+        foregroundSessionId = "";
         currentAsk = null;
         currentNotices.clear();
         editing = false;
@@ -1824,6 +2305,7 @@ public class MainActivity extends Activity {
         onSessionPage = true;
         editing = true;
         WatchUi.Page page = ui.page();
+        page.navTag = "model";
         ui.heading(page, "模型", "正在载入模型目录…");
         render(page);
         api.models(currentSessionId, result -> {
@@ -1849,6 +2331,7 @@ public class MainActivity extends Activity {
     /** 模型目录载入失败页。 */
     private void renderModelError(String error) {
         WatchUi.Page page = ui.page();
+        page.navTag = "model-error";
         ui.heading(page, "模型", "载入失败");
         ui.add(page, ui.text(error, 13, WatchUi.DANGER), 0, 12);
         ui.add(page, ui.button("返回会话", false, () -> {
@@ -1863,6 +2346,7 @@ public class MainActivity extends Activity {
         onSessionPage = true;
         editing = true;
         WatchUi.Page page = ui.page();
+        page.navTag = "model";
         ui.heading(page, "选择模型", "第 1 步 · 当前：" + currentModelLabel());
         currentModelCard(page);
         for (final Api.ProviderInfo provider : modelProviders) {
@@ -1892,7 +2376,7 @@ public class MainActivity extends Activity {
     /** 页首的「当前模型」卡片。 */
     private void currentModelCard(WatchUi.Page page) {
         LinearLayout card = ui.card();
-        card.addView(ui.text("当前使用", 11, WatchUi.ACCENT));
+        card.addView(ui.text("当前使用", 11, WatchUi.MUTED));
         TextView label = ui.text(currentModelLabel(), 13, WatchUi.FG);
         label.setPadding(0, ui.dp(5), 0, 0);
         card.addView(label);
@@ -1904,6 +2388,7 @@ public class MainActivity extends Activity {
         onSessionPage = true;
         editing = true;
         WatchUi.Page page = ui.page();
+        page.navTag = "model-effort";
         ui.heading(page, model.name, "第 2 步 · 选推理强度");
         currentModelCard(page);
         for (int i = 0; i < model.efforts.size(); i++) {
@@ -1956,6 +2441,7 @@ public class MainActivity extends Activity {
             // 仅字符串，不会失败
         }
         WatchUi.Page page = ui.page();
+        page.navTag = "model-apply";
         ui.heading(page, "切换中…", clipLine(model.name, 16));
         render(page);
         api.applySelections(sessionId, selections, result -> {
@@ -1997,6 +2483,7 @@ public class MainActivity extends Activity {
         onSessionPage = true;
         editing = true;
         WatchUi.Page page = ui.page();
+        page.navTag = "compose";
         ui.heading(page, "发消息", clipLine(currentSessionTitle, 16));
         final EditText input = new EditText(this);
         input.setHint("输入消息…");
@@ -2036,8 +2523,18 @@ public class MainActivity extends Activity {
 
     /** 发送消息：成功后立刻拉一次快照（新消息往往马上就有回复）。 */
     private void sendMessage(String text) {
-        if (text == null || text.trim().isEmpty()) return;
+        // 空输入不再静默返回——给出提示，否则像「按了没反应」。
+        if (text == null || text.trim().isEmpty()) {
+            showToast("先输入消息内容");
+            return;
+        }
         if (currentSessionId.isEmpty()) return;
+        // 只读会话：先开接管，确认成功后自动接着发这条消息。
+        if (!currentSessionTakeover) {
+            pendingComposeText = text.trim();
+            confirmEnableTakeover();
+            return;
+        }
         final String sessionId = currentSessionId;
         editing = false;
         renderSession("正在发送…");
@@ -2079,6 +2576,7 @@ public class MainActivity extends Activity {
         editing = true;
         final Api.Question question = ask.questions.get(index);
         WatchUi.Page page = ui.page();
+        page.navTag = "ask";
         String sub = question.header == null ? "" : question.header;
         if (ask.questions.size() > 1) {
             sub = "第 " + (index + 1) + "/" + ask.questions.size() + " 问"
@@ -2142,6 +2640,7 @@ public class MainActivity extends Activity {
         onSessionPage = true;
         editing = true;
         WatchUi.Page page = ui.page();
+        page.navTag = "ask-custom";
         ui.heading(page, "打字回答", clipLine(question.header == null || question.header.isEmpty()
                 ? question.question : question.header, 16));
         final EditText input = new EditText(this);
@@ -2234,6 +2733,7 @@ public class MainActivity extends Activity {
         }
         onSessionPage = true;
         WatchUi.Page page = ui.page();
+        page.navTag = "ask-submit";
         ui.heading(page, "正在提交…", "");
         render(page);
         api.respond(ask.sessionId, ask.callId, actionId, input, result -> {

@@ -264,6 +264,55 @@ final class Store {
         return value == null ? "" : value;
     }
 
+    // ------------------------------------------------------------ 界面设置
+
+    /** 界面设置用同一个存档文件；这些键与账号数据无关，换账号不清除。 */
+
+    /** 字号缩放：0.85 / 1.0 / 1.15 / 1.3。 */
+    private static final String KEY_FONT_SCALE = "fontScale";
+    /** 会话页自动刷新间隔（秒）：2 / 4 / 8。 */
+    private static final String KEY_REFRESH_SECONDS = "refreshSeconds";
+    /** 进会话页时默认「只看对话」。 */
+    private static final String KEY_ONLY_CONVERSATION = "onlyConversationDefault";
+
+    float fontScale() {
+        float value = prefs.getFloat(KEY_FONT_SCALE, 1.0f);
+        if (value < 0.8f || value > 1.6f) return 1.0f;
+        return value;
+    }
+
+    void setFontScale(float value) {
+        prefs.edit().putFloat(KEY_FONT_SCALE, value).apply();
+    }
+
+    int refreshSeconds() {
+        int value = prefs.getInt(KEY_REFRESH_SECONDS, 4);
+        return value >= 1 && value <= 30 ? value : 4;
+    }
+
+    void setRefreshSeconds(int seconds) {
+        prefs.edit().putInt(KEY_REFRESH_SECONDS, seconds).apply();
+    }
+
+    boolean onlyConversationDefault() {
+        return prefs.getBoolean(KEY_ONLY_CONVERSATION, false);
+    }
+
+    void setOnlyConversationDefault(boolean value) {
+        prefs.edit().putBoolean(KEY_ONLY_CONVERSATION, value).apply();
+    }
+
+    /** 后台提醒通知：AI 提问/审批时发系统通知（默认开）。 */
+    private static final String KEY_NOTIFY_ENABLED = "notifyEnabled";
+
+    boolean notifyEnabled() {
+        return prefs.getBoolean(KEY_NOTIFY_ENABLED, true);
+    }
+
+    void setNotifyEnabled(boolean value) {
+        prefs.edit().putBoolean(KEY_NOTIFY_ENABLED, value).apply();
+    }
+
     // ------------------------------------------------------------ 地址解析
 
     /** 解析结果：规范化后的根地址 + 协议 + 主机 + 端口。 */

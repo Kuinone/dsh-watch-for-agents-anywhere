@@ -20,42 +20,58 @@ import android.widget.TextView;
 /**
  * 圆屏适配的界面构件。
  *
- * 滚动区是一个矩形，而屏幕是圆：矩形四角必须落在圆内，内容才不会被圆弧切掉。
- * 设屏幕宽高为 1、圆心在 (0.5,0.5)、半径 0.5，左右边距 h、上下边距 v，
- * 则四角到圆心的距离是 sqrt((0.5-h)^2 + (0.5-v)^2)，必须 ≤ 半径。
+ * 圆屏适配 v2：不再把内容压进一个「圆的内接矩形」（那样四角全是空白，
+ * 用户看到的是上下两条黑边、两侧空间全部浪费）。现在的做法：
  *
- * 取 h=0.15、v=0.18 时该距离约 0.474，比半径小 0.026（约 12px），四角留有可见余量。
- * 这是本文件的硬约束：**任何改动都不得让四角跑出圆外**，否则卡片边缘会被圆弧啃掉。
+ * - 静态留白缩到很小（圆屏左右 7%、上下 4.5%），屏幕中段的行几乎铺满全宽；
+ * - {@link CurvedScrollView} 按每一行的纵向位置做缩放与淡出，越靠屏幕
+ *   上下边缘的行越小越透明——视觉上内容沿圆弧「弯进去」，既用满空间，
+ *   也不会有文字被表圈硬切（边缘行早已缩到安全区内且接近透明）；
+ * - 底部操作栏（可选）钉在屏幕底部，内容从它下面滚过。
+ *
  * 安全区只在 {@link #page()} 里按比例算一次，其余控件一律满宽，不加边距。
  */
 final class WatchUi {
-    /** 圆屏左右安全边距（屏宽的 15%）。 */
-    private static final float SIDE_RATIO = 0.15f;
-    /** 圆屏上下安全边距（屏高的 18%）。 */
-    private static final float VERTICAL_RATIO = 0.18f;
-    static final int BG = Color.rgb(9, 12, 18);
-    static final int SURFACE = Color.rgb(23, 29, 40);
-    static final int SURFACE_HI = Color.rgb(35, 44, 58);
-    static final int FG = Color.rgb(238, 242, 248);
-    static final int MUTED = Color.rgb(150, 165, 186);
-    static final int ACCENT = Color.rgb(122, 190, 255);
-    static final int ON_ACCENT = Color.rgb(9, 12, 18);
-    static final int WARN = Color.rgb(250, 184, 96);
-    static final int OK = Color.rgb(126, 217, 160);
-    static final int DANGER = Color.rgb(248, 132, 132);
+    /**
+     * 圆屏静态留白（v2）：只留最小必要的边，屏幕中段的行几乎铺满全宽；
+     * 边缘行由 {@link CurvedScrollView} 的缩放/淡出收进圆弧里。
+     */
+    private static final float SIDE_RATIO = 0.07f;
+    private static final float VERTICAL_RATIO = 0.045f;
+    /**
+     * AA 暗色配色（对照 AA 官方安卓客户端 Theme.kt 的 dark 方案）：
+     * 近黑中性底 + 锌灰面板 + 白色主操作按钮 + 语义色只用于状态。
+     * 主操作不再是蓝色——AA 的 primaryAction 是白底黑字，链接才是金色。
+     */
+    static final int BG = Color.rgb(9, 9, 11);            // canvas #09090B
+    static final int SURFACE = Color.rgb(31, 31, 33);     // raisedSurface #1F1F21
+    static final int SURFACE_HI = Color.rgb(42, 42, 45);  // subtle #2A2A2D
+    static final int FG = Color.rgb(250, 250, 250);       // ink #FAFAFA
+    static final int MUTED = Color.rgb(163, 163, 166);    // muted #A3A3A6
+    static final int FAINT = Color.rgb(115, 115, 118);    // faint #737376
+    /** 主操作色：AA 用纯白（primaryAction），文字用 ON_ACCENT 黑。 */
+    static final int ACCENT = Color.rgb(250, 250, 250);
+    static final int ON_ACCENT = Color.rgb(9, 9, 11);
+    /** 链接与可点文本：AA 的 linkColor 金。 */
+    static final int LINK = Color.rgb(235, 179, 83);
+    static final int WARN = Color.rgb(245, 158, 11);      // #F59E0B
+    static final int OK = Color.rgb(34, 197, 94);         // #22C55E
+    static final int DANGER = Color.rgb(249, 112, 102);   // #F97066
+    /** 进行中/切换中的蓝（runtimeTransitioning），只用于状态，不用于按钮。 */
+    static final int INFO = Color.rgb(59, 130, 246);
+    /** 会话状态强调色（AA 的 sessionStatusAccent 青绿）。 */
+    static final int TEAL = Color.rgb(101, 196, 166);     // sessionStatusAccentText #65C4A6
 
     /** 卡片顶部的浅一档颜色，与 SURFACE 组成几乎察觉不到、但能拉出厚度的垂直渐变。 */
-    private static final int CARD_TOP = Color.rgb(27, 34, 47);
-    /** 主按钮渐变的高光一档；底端仍落在 ACCENT，主色不偏离用户已熟悉的蓝。 */
-    private static final int ACCENT_TOP = Color.rgb(150, 207, 255);
+    private static final int CARD_TOP = Color.rgb(38, 38, 41);
     /** 页面顶部一层极弱的聚光：整屏纯平底色在圆屏上会显得发闷。 */
-    private static final int BACKDROP_TOP = Color.rgb(13, 18, 27);
-    /** 面板描边：低不透明度的浅蓝灰，只负责把边界勾出来，不参与配色。 */
-    private static final int STROKE = Color.argb(40, 152, 180, 216);
+    private static final int BACKDROP_TOP = Color.rgb(16, 16, 18);
+    /** 面板描边：低不透明度的浅灰，只负责把边界勾出来，不参与配色。 */
+    private static final int STROKE = Color.argb(60, 82, 82, 88);
     /** 分隔线，比正文弱两档；也用于「左侧细竖线」这类弱化标记。 */
-    static final int LINE = Color.rgb(36, 45, 60);
-    /** 按下波纹。 */
-    private static final int RIPPLE = Color.argb(46, 206, 228, 255);
+    static final int LINE = Color.rgb(39, 39, 42);        // border #27272A
+    /** 按下波纹（暗面板上用白波纹）。 */
+    private static final int RIPPLE = Color.argb(38, 250, 250, 250);
 
     final Activity activity;
 
@@ -64,6 +80,10 @@ final class WatchUi {
         final FrameLayout root;
         final ScrollView scroll;
         final LinearLayout content;
+        /** 导航标签：MainActivity.render() 用它判断「换页」，决定是否播放入场动画。 */
+        String navTag;
+        /** 固定底栏（可选）：由 {@link #bottomBar} 创建，钉在页面底部、不随内容滚动。 */
+        LinearLayout bottomBar;
         private Runnable onSwipeLeft;
         private Runnable onSwipeRight;
 
@@ -93,7 +113,14 @@ final class WatchUi {
 
         /** 滚动到底部（进入会话时用来直接看到最新内容）。 */
         void scrollToBottom() {
-            scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+            // 直接滚到「内容高度 − 可视高度」，不依赖焦点：fullScroll(FOCUS_DOWN)
+            // 在没有可聚焦子控件时行为不稳定，长对话有时就停在中途。
+            scroll.post(() -> {
+                View content = scroll.getChildAt(0);
+                if (content == null) return;
+                int max = Math.max(0, content.getHeight() - scroll.getHeight());
+                scroll.scrollTo(0, max);
+            });
         }
     }
 
@@ -101,12 +128,25 @@ final class WatchUi {
         this.activity = activity;
     }
 
+    /** 界面字号缩放：设置页里调（0.85 / 1.0 / 1.15 / 1.3），作用于全部文字。 */
+    private float fontScale = 1.0f;
+
+    void setFontScale(float value) {
+        if (value < 0.8f) value = 0.8f;
+        if (value > 1.6f) value = 1.6f;
+        this.fontScale = value;
+    }
+
+    float fontScale() {
+        return fontScale;
+    }
+
     int dp(float value) {
         return Math.round(value * activity.getResources().getDisplayMetrics().density);
     }
 
     /**
-     * 建立一个带安全边距、支持表冠滚动的页面。
+     * 建立一个页面：全屏滚动 + 曲面列表效果 + 可选固定底栏。
      *
      * 页面同时识别左右滑动：由调用方通过 {@link Page#setOnSwipeLeft} / {@link Page#setOnSwipeRight}
      * 注册回调，这样各页面可以自行决定「右滑返回、左滑开菜单」这类行为。
@@ -117,7 +157,7 @@ final class WatchUi {
         // 作用是在圆屏四周露出一圈底色时仍有层次，而不是一块死板的纯色。
         root.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
                 new int[]{BACKDROP_TOP, BG}));
-        ScrollView scroll = new ScrollView(activity);
+        CurvedScrollView scroll = new CurvedScrollView(activity);
         scroll.setFillViewport(false);
         scroll.setClipToPadding(false);
         scroll.setVerticalScrollBarEnabled(false);
@@ -127,20 +167,26 @@ final class WatchUi {
         LinearLayout content = new LinearLayout(activity);
         content.setOrientation(LinearLayout.VERTICAL);
         scroll.addView(content, new ScrollView.LayoutParams(-1, -2));
-        root.addView(scroll, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+        // 滚动区满屏：留白做在内容列的 padding 上（比 v1 的 ScrollView margin
+        // 小得多），曲面缩放负责把边缘行的宽度收进圆里。
+        root.addView(scroll, new FrameLayout.LayoutParams(-1, -1));
         Page page = new Page(root, scroll, content);
-        root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+        root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or2, ob2) -> {
             int width = r - l;
             int height = b - t;
-            boolean round = activity.getResources().getConfiguration().isScreenRound();
-            // 圆屏侧边留出内接矩形之外的部分；上下留白略大于左右，
-            // 因为顶部状态栏与底部圆角都会压到内容。
+            // 圆屏判定不能只信 isScreenRound()：不少全安卓圆表（如 454×454 的
+            // 1.39 寸表）配置里报的是方形屏幕，此时按方屏只留 8dp 边距，
+            // 内容四角会被圆弧切掉。凡接近正方形的小屏一律按圆屏布局。
+            boolean round = activity.getResources().getConfiguration().isScreenRound()
+                    || Math.abs(width - height) <= Math.max(4, dp(3));
+            scroll.curved = round;
+            // 圆屏：左右 7%、上下 4.5% 的最小留白；中段行几乎铺满，边缘交给
+            // 曲面缩放收窄。方屏维持 8dp。
             int side = round ? Math.round(width * SIDE_RATIO) : dp(8);
             int vertical = round ? Math.round(height * VERTICAL_RATIO) : dp(8);
-            FrameLayout.LayoutParams current = (FrameLayout.LayoutParams) scroll.getLayoutParams();
-            if (current.leftMargin != side || current.topMargin != vertical) {
-                current.setMargins(side, vertical, side, vertical);
-                scroll.setLayoutParams(current);
+            int bottomKeep = content.getPaddingBottom();
+            if (content.getPaddingLeft() != side || content.getPaddingTop() != vertical) {
+                content.setPadding(side, vertical, side, bottomKeep);
             }
         });
         scroll.setOnGenericMotionListener((v, event) -> {
@@ -156,6 +202,126 @@ final class WatchUi {
         // ScrollView 消费掉，左滑会被当成纵向滚动。改由 MainActivity 的
         // dispatchTouchEvent 统一判定（配合 page 上的滑动回调）。
         return page;
+    }
+
+    /**
+     * 取页面的固定底栏；没有就建一个。
+     *
+     * 底栏钉在屏幕底部（不随内容滚动），背景不透明并带一条上边线，滚动内容
+     * 从它下面穿过去。调用方往返回的行容器里加按钮即可（配 weighted 平分）。
+     * 内容列会自动让出底栏高度，保证最后几行能滚到底栏上方完整可见。
+     */
+    LinearLayout bottomBar(Page page) {
+        if (page.bottomBar != null) return page.bottomBar;
+        LinearLayout row = new LinearLayout(activity);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(7), 0, dp(7));
+        LinearLayout wrapper = new LinearLayout(activity);
+        wrapper.setOrientation(LinearLayout.VERTICAL);
+        wrapper.setBackgroundColor(BG);
+        View line = new View(activity);
+        line.setBackgroundColor(LINE);
+        wrapper.addView(line, new LinearLayout.LayoutParams(-1, Math.max(1, dp(0.6f))));
+        wrapper.addView(row, new LinearLayout.LayoutParams(-1, -2));
+        page.root.addView(wrapper, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+        page.bottomBar = row;
+        // 内容列让出底栏高度：等底栏量完尺寸后设置（下一帧），期间内容仍可见。
+        Runnable applyPadding = () -> {
+            int extra = wrapper.getHeight();
+            if (extra > 0 && page.content.getPaddingBottom() != extra) {
+                page.content.setPadding(page.content.getPaddingLeft(),
+                        page.content.getPaddingTop(),
+                        page.content.getPaddingRight(), extra);
+            }
+        };
+        page.root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or2, ob2) -> applyPadding.run());
+        return row;
+    }
+
+    /**
+     * 曲面滚动容器（仅圆屏启用）。
+     *
+     * Wear OS ScalingLazyColumn 思路的轻量实现：每一行按它在可视区里的纵向
+     * 位置做缩放与淡出，越靠上下边缘越小越透明。行本身仍是满宽布局，只是
+     * 视觉收窄，不产生布局反馈环；触摸/点击坐标跟随视图变换矩阵，交互不变。
+     */
+    private final class CurvedScrollView extends ScrollView {
+        /** 是否启用曲面效果：由 page() 的布局监听按圆屏判定设置。 */
+        boolean curved;
+
+        CurvedScrollView(android.content.Context context) {
+            super(context);
+        }
+
+        @Override
+        protected void onScrollChanged(int l, int t, int oldl, int oldt) {
+            super.onScrollChanged(l, t, oldl, oldt);
+            applyCurve();
+        }
+
+        @Override
+        protected void onLayout(boolean changed, int l, int t, int r, int b) {
+            super.onLayout(changed, l, t, r, b);
+            applyCurve();
+        }
+
+        /** 边缘缩放与淡出：靠边区段内平滑过渡（中心区完全不动）。 */
+        private void applyCurve() {
+            if (!curved || getHeight() == 0) return;
+            View column = getChildAt(0);
+            if (!(column instanceof android.view.ViewGroup)) return;
+            android.view.ViewGroup rows = (android.view.ViewGroup) column;
+            float half = getHeight() / 2f;
+            float center = half;
+            for (int i = 0; i < rows.getChildCount(); i++) {
+                transformRow(rows.getChildAt(i), 0, half, center);
+            }
+        }
+
+        /**
+         * 对一行应用曲面变换。
+         *
+         * 会话页的内容整体包在一个透明竖排容器（contentArea）里，气泡外又各包
+         * 一层透明的 wrapper——若只把最外层容器当成一行变换，整块对话要么完全
+         * 不动、要么一起淡出，看起来就是「对话没有曲面效果」。因此对「透明的
+         * 竖排 LinearLayout」逐层下钻，把真正的内容行（气泡文本、卡片、按钮）
+         * 按它们在滚动区里的绝对位置各自变换。有底色或带点击的行视为整体，
+         * 不再下钻。
+         */
+        private void transformRow(View row, int topOffset, float half, float center) {
+            if (row.getVisibility() != View.VISIBLE || row.getHeight() == 0) return;
+            if (isPlainColumn(row)) {
+                android.view.ViewGroup group = (android.view.ViewGroup) row;
+                for (int i = 0; i < group.getChildCount(); i++) {
+                    View child = group.getChildAt(i);
+                    transformRow(child, topOffset + row.getTop(), half, center);
+                }
+                return;
+            }
+            int top = topOffset + row.getTop();
+            float d = Math.abs(top + row.getHeight() / 2f - getScrollY() - center) / half;
+            if (d > 1f) d = 1f;
+            // 中心 45% 不动，之后越远缩得越多：边缘行约 84% 大小、55% 透明度。
+            // 刻意比 ScalingLazyColumn 温和——会话页顶部是标题，静止时不能太暗。
+            float edge = d <= 0.45f ? 0f : (d - 0.45f) / 0.55f;
+            float scale = 1f - 0.16f * edge * edge;
+            float alpha = 1f - 0.55f * edge * edge * edge;
+            row.setPivotX(row.getWidth() / 2f);
+            row.setPivotY(row.getHeight() / 2f);
+            if (row.getScaleX() != scale) row.setScaleX(scale);
+            if (row.getScaleY() != scale) row.setScaleY(scale);
+            if (row.getAlpha() != alpha) row.setAlpha(alpha);
+        }
+
+        /** 透明的竖排容器：没有底色、不响应点击，只是排版用的分组。 */
+        private boolean isPlainColumn(View row) {
+            if (!(row instanceof LinearLayout)) return false;
+            LinearLayout column = (LinearLayout) row;
+            return column.getOrientation() == LinearLayout.VERTICAL
+                    && column.getBackground() == null
+                    && !column.hasOnClickListeners();
+        }
     }
 
     /**
@@ -236,7 +402,7 @@ final class WatchUi {
     TextView text(CharSequence value, float size, int color) {
         TextView view = new TextView(activity);
         view.setText(value);
-        view.setTextSize(size);
+        view.setTextSize(size * fontScale);
         view.setTextColor(color);
         view.setIncludeFontPadding(false);
         view.setLineSpacing(dp(2), 1.16f);
@@ -321,11 +487,11 @@ final class WatchUi {
      * 在窄圆屏上会被固有宽度顶住、无法撑满整行（曾出现同排两个按钮宽度不一致、
      * 标题折成两行）。这里自己画背景，宽度完全交给父容器决定。
      *
-     * 主次按钮的区分放在「底色 + 字重 + 描边」三处，而不是只靠深浅：
-     * 主按钮是亮蓝渐变实心配深色粗体字，次按钮是深色底 + 细描边配蓝色常规字。
+     * AA 风格的主按钮是白底黑字胶囊（primaryAction #FAFAFA），
+     * 次按钮是深灰面板 + 白字的胶囊（secondaryAction）。
      */
     TextView button(String label, boolean primary, Runnable action) {
-        TextView button = text(label, 14, primary ? ON_ACCENT : ACCENT);
+        TextView button = text(label, 14, primary ? ON_ACCENT : FG);
         button.setTypeface(Typeface.DEFAULT, primary ? Typeface.BOLD : Typeface.NORMAL);
         button.setGravity(Gravity.CENTER);
         button.setMaxLines(1);
@@ -337,11 +503,20 @@ final class WatchUi {
         // 单行按钮不需要行距，留着会把文字顶得偏上。
         button.setLineSpacing(0, 1f);
         button.setPadding(dp(10), dp(14), dp(10), dp(14));
-        button.setBackground(primary ? buttonPrimaryBackground() : surface(SURFACE, 16));
+        button.setBackground(primary ? buttonPrimaryBackground() : buttonSecondaryBackground());
         button.setClickable(true);
         button.setFocusable(true);
         button.setOnClickListener(v -> action.run());
         return button;
+    }
+
+    /** 次按钮背景：深灰面板 + 细描边，与主按钮的白形成层次而不是靠颜色。 */
+    private android.graphics.drawable.Drawable buttonSecondaryBackground() {
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(SURFACE_HI);
+        shape.setCornerRadius(dp(24));
+        shape.setStroke(Math.max(1, dp(0.8f)), STROKE);
+        return new RippleDrawable(ColorStateList.valueOf(RIPPLE), shape, null);
     }
 
     /** 可点击的行：标题 + 可选副标题，整行高度不低于 48dp。 */
@@ -390,7 +565,13 @@ final class WatchUi {
         return chip;
     }
 
-    /** 对话气泡：用户靠右用强调色，助手靠左用卡片色。 */
+    /**
+     * 对话气泡。
+     *
+     * 对齐 AA 的聊天排版：助手消息不用气泡底色，直接铺在画布上、占满整行；
+     * 用户消息靠右，用深一档的面板色胶囊。彩底气泡已去掉——AA 风格里
+     * 颜色只标状态，不标说话人。
+     */
     View bubble(String body, boolean fromUser) {
         return bubbleRich(body, fromUser);
     }
@@ -400,16 +581,41 @@ final class WatchUi {
      *
      * 正文可能带 Markdown 样式（粗体、等宽、底色），因此用 Spannable 而不是纯字符串。
      * 长文本要能正常折行，所以宽度用 WRAP_CONTENT 加上限，不能固定宽度。
+     *
+     * copyText 不为空时支持长按复制（复制的是原始 Markdown 文本）。
      */
     View bubbleRich(CharSequence body, boolean fromUser) {
+        return bubbleRich(body, fromUser, null);
+    }
+
+    View bubbleRich(CharSequence body, boolean fromUser, String copyText) {
         LinearLayout wrapper = new LinearLayout(activity);
         wrapper.setOrientation(LinearLayout.VERTICAL);
-        TextView view = text(body, 13, fromUser ? ON_ACCENT : FG);
+        // 15sp：手表 1.39 寸屏上 13sp 偏小；Markdown 标题等相对缩放都以此为基准。
+        TextView view = text(body, 15, FG);
         view.setPadding(dp(11), dp(9), dp(11), dp(9));
-        view.setBackground(bubbleBackground(fromUser));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
-        params.gravity = fromUser ? Gravity.END : Gravity.START;
-        wrapper.addView(view, params);
+        if (fromUser) {
+            view.setBackground(bubbleBackground(true));
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
+            params.gravity = Gravity.END;
+            wrapper.addView(view, params);
+        } else {
+            // 助手消息直接铺在画布上（AA 的做法），不占底色、不吃宽度。
+            view.setPadding(0, dp(1), 0, dp(1));
+            view.setBackground(null);
+            wrapper.addView(view, new LinearLayout.LayoutParams(-1, -2));
+        }
+        if (copyText != null && !copyText.isEmpty()) {
+            view.setOnLongClickListener(v -> {
+                Object service = activity.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+                if (service instanceof android.content.ClipboardManager) {
+                    ((android.content.ClipboardManager) service).setPrimaryClip(
+                            android.content.ClipData.newPlainText("消息", copyText));
+                    android.widget.Toast.makeText(activity, "已复制", android.widget.Toast.LENGTH_SHORT).show();
+                }
+                return true;
+            });
+        }
         return wrapper;
     }
 
@@ -436,12 +642,12 @@ final class WatchUi {
         return new RippleDrawable(ColorStateList.valueOf(RIPPLE), shape, null);
     }
 
-    /** 主按钮：亮蓝渐变 + 白色波纹，按下时整块明显变亮。 */
+    /** 主按钮：白色胶囊（AA 的 primaryAction），按下时用暗波纹显出反馈。 */
     private android.graphics.drawable.Drawable buttonPrimaryBackground() {
-        GradientDrawable shape = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{ACCENT_TOP, ACCENT});
-        shape.setCornerRadius(dp(16));
-        return new RippleDrawable(ColorStateList.valueOf(Color.argb(56, 255, 255, 255)), shape, null);
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(ACCENT);
+        shape.setCornerRadius(dp(24));
+        return new RippleDrawable(ColorStateList.valueOf(Color.argb(46, 0, 0, 0)), shape, null);
     }
 
     /** 卡片：极轻的垂直渐变让卡片有厚度，描边把边界从背景里勾出来。 */
@@ -454,20 +660,20 @@ final class WatchUi {
     }
 
     /**
-     * 气泡背景：靠内的一侧两角收小、外侧两角放大，形成指向说话人的「尾巴」。
-     * 用户消息靠右，收右下角；助手消息靠左，收左下角。
+     * 用户消息的胶囊背景：右下角收小，形成指向右侧的「尾巴」。
+     * 助手消息现在没有底色，此方法只剩用户一侧在用（保留完整分支便于调整）。
      * 角的顺序是「左上、右上、右下、左下」，每角两个值（x/y 半径）。
      */
     private android.graphics.drawable.Drawable bubbleBackground(boolean fromUser) {
-        int big = dp(16);
+        int big = dp(18);
         int small = dp(5);
         float[] radii = fromUser
                 ? new float[]{big, big, big, big, small, small, big, big}
                 : new float[]{small, small, big, big, big, big, big, big};
         GradientDrawable shape = new GradientDrawable();
-        shape.setColor(fromUser ? ACCENT : SURFACE);
+        shape.setColor(SURFACE_HI);
         shape.setCornerRadii(radii);
-        if (!fromUser) shape.setStroke(Math.max(1, dp(0.8f)), STROKE);
+        shape.setStroke(Math.max(1, dp(0.8f)), STROKE);
         return shape;
     }
 
