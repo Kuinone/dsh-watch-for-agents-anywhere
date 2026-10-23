@@ -118,8 +118,9 @@ public class MainActivity extends Activity {
         public void run() {
             if (destroyed || !onSessionPage) return;
             if (currentSessionId.isEmpty()) return;
-            // 正在输入、或用户刚滑过，就跳过本次刷新，避免重建把界面顶掉。
-            if (!editing && !recentlyTouched()) loadSession(currentSessionId, true);
+            // 正在输入、刚触摸过、或用户正跟手拖拽换页，就跳过本次刷新，
+            // 避免重建把界面顶掉。
+            if (swipeDragging || !editing && !recentlyTouched()) loadSession(currentSessionId, true);
             refresh.postDelayed(this, sessionRefreshMs());
         }
     };
@@ -127,7 +128,7 @@ public class MainActivity extends Activity {
         @Override
         public void run() {
             if (destroyed || onSessionPage) return;
-            if (!recentlyTouched()) loadSessions(true, false);
+            if (!swipeDragging && !recentlyTouched()) loadSessions(true, false);
             refresh.postDelayed(this, LIST_REFRESH_MS);
         }
     };
@@ -151,18 +152,138 @@ public class MainActivity extends Activity {
             lastInteractionAt = System.currentTimeMillis();
         }
         // 操作菜单已打开时不做手势判定，避免与面板内的点击冲突。
-        if (!menuOpen && gesture != null && currentPage != null) {
-            boolean consumed = gesture.onTouch(currentPage, event);
-            if (consumed) {
-                // 横向手势已消费本次事件：补一个取消事件给子视图，避免它们停在按下态。
-                MotionEvent cancel = MotionEvent.obtain(event);
-                cancel.setAction(MotionEvent.ACTION_CANCEL);
-                super.dispatchTouchEvent(cancel);
-                cancel.recycle();
-                return true;
+        if (menuOpen || currentPage == null || destroyed) {
+            return super.dispatchTouchEvent(event);
+        }
+        float density = getResources().getDisplayMetrics().density;
+        float triggerPx = 44 * density;
+        switch (action) {
+            case MotionEvent.ACTION_DOWN: {
+                swipeDownX = event.getRawX();
+                swipeDownY = event.getRawY();
+                swipeDecided = false;
+                swipeDragging = false;
+                gestureMaxDx = 0f;
+                gestureMaxDy = 0f;
+                break;
+            }
+            case MotionEvent.ACTION_MOVE: {
+                float dx = event.getRawX() - swipeDownX;
+                float dy = event.getRawY() - swipeDownY;
+                if (swipeDragging) {
+                    // 跟手：页面实时跟随手指（带阻尼，拖到头也不会整页出屏）。
+                    float shift = Math.max(0f, dx) * 0.7f;
+                    swipeShift = shift;
+                    currentPage.root.setTranslationX(shift);
+                    return true;
+                }
+                // 整个手势期间的最大位移——注入的滑动常被拆成很多小步，抬手
+                // 兜底判定必须按它来。
+                if (Math.abs(dx) > Math.abs(gestureMaxDx)) gestureMaxDx = dx;
+                if (Math.abs(dy) > Math.abs(gestureMaxDy)) gestureMaxDy = Math.abs(dy);
+                if (!swipeDecided
+                        && (Math.abs(dx) > 10 * density || Math.abs(dy) > 10 * density)) {
+                    swipeDecided = true;
+                    // 明显偏右的横向意图才进入跟手拖拽（系统返回手势的样子）。
+                    if (dx > 0 && Math.abs(dx) > Math.abs(dy) * 1.15f
+                            && currentPage.onSwipeRight != null) {
+                        addSwipeBackdrop();
+                        swipeDragging = true;
+                        // 拦下来之前先取消子视图的按下状态，避免 ScrollView 卡在滚动中。
+                        MotionEvent cancel = MotionEvent.obtain(event);
+                        cancel.setAction(MotionEvent.ACTION_CANCEL);
+                        super.dispatchTouchEvent(cancel);
+                        cancel.recycle();
+                        return true;
+                    }
+                    // 左滑不跟手：菜单从右滑入自带动画，维持抬手判定。
+                }
+                break;
+            }
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL: {
+                if (swipeDragging) {
+                    swipeDragging = false;
+                    View root = currentPage.root;
+                    boolean enough = swipeShift >= triggerPx
+                            || swipeShift >= getResources().getDisplayMetrics().widthPixels * 0.22f;
+                    if (enough && action == MotionEvent.ACTION_UP) {
+                        // 完成转场：从当前位置飞出全屏，然后执行该页定义的右滑动作
+                        // （返回上一级 / 双滑退出的提示 / 真正退出）。
+                        float width = getResources().getDisplayMetrics().widthPixels;
+                        root.animate().translationX(width).setDuration(160)
+                                .setInterpolator(new android.view.animation.AccelerateInterpolator(1.6f))
+                                .withEndAction(() -> {
+                                    swipeTransition = true;
+                                    currentPage.fireSwipeRight();
+                                })
+                                .start();
+                    } else {
+                        // 没过阈值或手势被打断：弹回原位。
+                        root.animate().translationX(0f).setDuration(180)
+                                .setInterpolator(new android.view.animation.DecelerateInterpolator(1.7f))
+                                .withEndAction(this::removeSwipeBackdrop)
+                                .start();
+                    }
+                    return true;
+                }
+                if (action == MotionEvent.ACTION_UP && Math.abs(gestureMaxDx) >= triggerPx
+                        && Math.abs(gestureMaxDx) > gestureMaxDy * 1.2f) {
+                    // 抬手兜底：快甩（两帧内就超过阈值）没有中间判定帧，按总位移补判。
+                    if (gestureMaxDx > 0) currentPage.fireSwipeRight();
+                    else currentPage.fireSwipeLeft();
+                    return true;
+                }
+                break;
             }
         }
         return super.dispatchTouchEvent(event);
+    }
+
+    /** 右滑拖拽状态：按下起点与判定标志。 */
+    private float swipeDownX;
+    private float swipeDownY;
+    private boolean swipeDecided;
+    /** 正在跟手拖拽（页面已拦截触摸、实时平移）。 */
+    private boolean swipeDragging;
+    /** 拖拽期间页面的当前平移量（阻尼后）。 */
+    private float swipeShift;
+    /** 整个手势期间的最大横向/纵向位移（抬手兜底判定用）。 */
+    private float gestureMaxDx;
+    private float gestureMaxDy;
+    /** 拖拽期间垫在页面底下的画布色底。 */
+    private View swipeBackdrop;
+    /** 拖拽刚完成转场：下一次 render 不铺旧页快照（旧页已经飞出屏了）。 */
+    private boolean swipeTransition;
+
+    /** 拖拽期间垫底：页面拖出后露出的是画布色而不是窗口背景。 */
+    private void addSwipeBackdrop() {
+        if (swipeBackdrop != null) return;
+        View backdrop = new View(this);
+        backdrop.setBackgroundColor(WatchUi.BG);
+        ViewGroup content = (ViewGroup) findViewById(android.R.id.content);
+        content.addView(backdrop, 0, new ViewGroup.LayoutParams(-1, -1));
+        swipeBackdrop = backdrop;
+    }
+
+    private void removeSwipeBackdrop() {
+        if (swipeBackdrop == null) return;
+        ((ViewGroup) findViewById(android.R.id.content)).removeView(swipeBackdrop);
+        swipeBackdrop = null;
+    }
+
+    /**
+     * 页面拖出全屏后动作没有换页（例如「再滑一次退出」只给了提示）：
+     * 让页面从右侧滑回来，配合提示形成「想退出？再确认一下」的完整反馈。
+     */
+    private void springBackCurrentPage() {
+        if (currentPage == null || destroyed) return;
+        View root = currentPage.root;
+        root.setAlpha(1f);
+        root.animate().translationX(0f).setDuration(220)
+                .setInterpolator(new android.view.animation.DecelerateInterpolator(1.7f))
+                .withEndAction(this::removeSwipeBackdrop)
+                .start();
     }
 
     /** 诊断用：把手势判定过程写入 logcat（tag=dshwatch）。 */
@@ -170,8 +291,6 @@ public class MainActivity extends Activity {
         android.util.Log.d("dshwatch", message);
     }
 
-    /** 手势识别器（与设备密度相关，延迟初始化）。 */
-    private WatchUi.HorizontalGesture gesture;
     /** 当前页面的手势回调持有者。 */
     private WatchUi.Page currentPage;
     /** 操作菜单是否打开。 */
@@ -312,9 +431,6 @@ public class MainActivity extends Activity {
      * 显式指定的（返回时从左滑入），否则默认从右滑入（前进的手感）。
      */
     private void render(WatchUi.Page page) {
-        if (gesture == null) {
-            gesture = new WatchUi.HorizontalGesture(getResources().getDisplayMetrics().density);
-        }
         int restore = resetScrollOnNextRender ? 0 : currentScroll();
         resetScrollOnNextRender = false;
         // 换页判定：标签变了才算导航。第一次渲染（启动）不播动画。
@@ -346,9 +462,13 @@ public class MainActivity extends Activity {
 
         // 旧页快照铺底：一般应用的转场是「新页滑入盖住旧页」。快照让旧页在
         // 新页滑入期间保持静止可见，视觉连续；动画结束即移除并回收。
+        // 拖拽刚完成转场时例外：旧页已经飞出屏外，快照只会拍到空画布。
         boolean animate = direction != 0 && !pendingScrollToBottom
                 && previous != null
-                && previous.root.getWidth() > 0 && previous.root.getHeight() > 0;
+                && previous.root.getWidth() > 0 && previous.root.getHeight() > 0
+                && previous.root.getTranslationX() == 0f
+                && !swipeTransition;
+        swipeTransition = false;
         ImageView ghost = null;
         Bitmap shot = null;
         if (animate) {
@@ -370,6 +490,8 @@ public class MainActivity extends Activity {
             View child = content.getChildAt(i);
             if (child != page.root && child != ghost) content.removeViewAt(i);
         }
+        // 拖拽垫底若还在窗口里，已被上面的清理循环一并移除——同步字段。
+        swipeBackdrop = null;
 
         if (animate && ghost != null) {
             // 入场：新页从侧面滑入 + 淡入，盖在静止的旧页快照上（Activity 转场
@@ -465,15 +587,20 @@ public class MainActivity extends Activity {
             finishAndRemoveTask();
             return;
         }
+        View root = currentPage.root;
+        if (root.getTranslationX() > 0) {
+            // 跟手拖拽已完成（页面已经拖出全屏）：直接退出，不再重复动画。
+            finishAndRemoveTask();
+            overridePendingTransition(0, 0);
+            return;
+        }
+        // 动画期间定时刷新会把整页重建（setContentView 换掉正在动画的根视图），
+        // 看起来就是「闪一下、没有动画」——先把两个 ticker 摘掉。
         refresh.removeCallbacks(sessionTicker);
         refresh.removeCallbacks(listTicker);
         editing = false;
-        View root = currentPage.root;
         if (root.getParent() instanceof ViewGroup) {
-            View backdrop = new View(this);
-            backdrop.setBackgroundColor(WatchUi.BG);
-            ((ViewGroup) root.getParent()).addView(backdrop, 0,
-                    new ViewGroup.LayoutParams(-1, -1));
+            addSwipeBackdrop();
         }
         float travel = getResources().getDisplayMetrics().widthPixels;
         root.animate().translationX(travel).alpha(0f)
@@ -928,8 +1055,10 @@ public class MainActivity extends Activity {
             if (now - lastExitSwipe < 2500) {
                 exitApp();
             } else {
+                // 第一次只提示；页面从右侧滑回来，配合提示形成完整反馈。
                 lastExitSwipe = now;
                 showToast("再滑一次退出");
+                springBackCurrentPage();
             }
         });
         page.setOnSwipeLeft(() -> showActionMenu(menuForProjects()));

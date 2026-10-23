@@ -84,8 +84,9 @@ final class WatchUi {
         String navTag;
         /** 固定底栏（可选）：由 {@link #bottomBar} 创建，钉在页面底部、不随内容滚动。 */
         LinearLayout bottomBar;
-        private Runnable onSwipeLeft;
-        private Runnable onSwipeRight;
+        /* 拖拽状态机需要直接探测「这页有没有右滑动作」——包可见。 */
+        Runnable onSwipeLeft;
+        Runnable onSwipeRight;
 
         Page(FrameLayout root, ScrollView scroll, LinearLayout content) {
             this.root = root;
@@ -321,75 +322,6 @@ final class WatchUi {
             return column.getOrientation() == LinearLayout.VERTICAL
                     && column.getBackground() == null
                     && !column.hasOnClickListeners();
-        }
-    }
-
-    /**
-     * 横向滑动识别器。
-     *
-     * 由 MainActivity 在 dispatchTouchEvent 里驱动：只有那里能拿到「还没被子视图
-     * 消费」的原始事件，挂在页面根容器上会被 ScrollView 抢先吃掉纵向与横向手势。
-     *
-     * 只认明显偏水平的滑动（横向位移 ≥44dp 且大于纵向的 1.2 倍），
-     * 否则手表上最常用的上下翻页会被误判成菜单手势。
-     */
-    static final class HorizontalGesture {
-        private static final int TRIGGER_DP = 44;
-
-        private final float triggerPx;
-        private float startX;
-        private float startY;
-        private float maxDx;
-        private float maxDy;
-        private boolean triggered;
-
-        HorizontalGesture(float density) {
-            this.triggerPx = TRIGGER_DP * density;
-        }
-
-        boolean onTouch(WatchUi.Page page, MotionEvent event) {
-            if (page == null) return false;
-            switch (event.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    startX = event.getX();
-                    startY = event.getY();
-                    maxDx = 0f;
-                    maxDy = 0f;
-                    triggered = false;
-                    return false;
-                case MotionEvent.ACTION_MOVE: {
-                    if (triggered) return true;
-                    float dx = event.getX() - startX;
-                    float dy = event.getY() - startY;
-                    // 记录本次手势的最远位移，抬手时按它判定（避免逐帧抖动导致漏判）。
-                    if (Math.abs(dx) > Math.abs(maxDx)) maxDx = dx;
-                    if (Math.abs(dy) > Math.abs(maxDy)) maxDy = dy;
-                    if (Math.abs(dx) >= triggerPx && Math.abs(dx) > Math.abs(dy) * 1.2f) {
-                        triggered = true;
-                        if (dx > 0) page.fireSwipeRight();
-                        else page.fireSwipeLeft();
-                        return true;
-                    }
-                    return false;
-                }
-                case MotionEvent.ACTION_UP:
-                case MotionEvent.ACTION_CANCEL: {
-                    if (triggered) {
-                        triggered = false;
-                        return true;
-                    }
-                    // 用整个手势期间的最大位移判定：注入的滑动往往被拆成很多小步，
-                    // 只看抬手那一帧的位移会漏判。
-                    if (Math.abs(maxDx) >= triggerPx && Math.abs(maxDx) > Math.abs(maxDy) * 1.2f) {
-                        if (maxDx > 0) page.fireSwipeRight();
-                        else page.fireSwipeLeft();
-                        return true;
-                    }
-                    return false;
-                }
-                default:
-                    return false;
-            }
         }
     }
 
