@@ -103,6 +103,8 @@ try {
     $linkArgs = @('link', '-o', (Join-Path $build 'base.apk'), '-I', $androidJar,
         '--manifest', (Join-Path $main 'AndroidManifest.xml'),
         '--java', (Join-Path $build 'gen'),
+        # -A 打包 assets 原样进 APK（Material Icons 字体在这里，缺了它图标全是方框）。
+        '-A', (Join-Path $main 'assets'),
         '--version-code', '1', '--version-name', '1.0.0',
         '--min-sdk-version', '26', '--target-sdk-version', '33') + $flats
     $code = Invoke-Step $aapt2 $linkArgs 'aapt2-link'

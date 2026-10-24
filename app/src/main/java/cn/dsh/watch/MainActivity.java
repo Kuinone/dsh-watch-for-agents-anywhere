@@ -87,6 +87,9 @@ public class MainActivity extends Activity {
      * 确认成功后自动把这排消息发出去。
      */
     private String pendingComposeText;
+    /** 从答题页转来的待提交答案：接管开启成功后自动继续提交。 */
+    private Api.Ask pendingAsk;
+    private List<List<String>> pendingChosen;
     private boolean loadingSession;
 
     private boolean onSessionPage;
@@ -242,6 +245,20 @@ public class MainActivity extends Activity {
                     super.dispatchTouchEvent(cancel);
                     cancel.recycle();
                     showMorePage();
+                    return true;
+                }
+                if (action == MotionEvent.ACTION_UP && edgeSwipe
+                        && event.getRawY() - swipeDownY >= triggerPx
+                        && Math.abs(event.getRawX() - swipeDownX) * 1.2f < event.getRawY() - swipeDownY
+                        && currentPage != null && "more".equals(currentPage.navTag)) {
+                    // 「更多」页是从底部上滑进入的，返回也对称：底部边缘下滑。
+                    // 右滑返回留给列表/会话这些横向层级；这里是纵向进出。
+                    edgeSwipe = false;
+                    MotionEvent cancel = MotionEvent.obtain(event);
+                    cancel.setAction(MotionEvent.ACTION_CANCEL);
+                    super.dispatchTouchEvent(cancel);
+                    cancel.recycle();
+                    closeMorePage();
                     return true;
                 }
                 if (action == MotionEvent.ACTION_UP && Math.abs(gestureMaxDx) >= triggerPx
@@ -510,12 +527,12 @@ public class MainActivity extends Activity {
         swipeBackdrop = null;
 
         if (animate && ghost != null) {
-            // 前进：快照转场结束后留着当「上一层」——右滑拖拽返回时铺底露出
+            // 快照转场结束后留着当「上一层」——右滑拖拽返回时铺底露出
             // 上一层的样子（系统返回手势的体验），而不是一块纯色。
-            if (direction > 0) {
-                if (backShot != null) backShot.recycle();
-                backShot = shot;
-            }
+            // 两个方向都转存：前进时旧页是下一层；返回时旧页正是上一层本身，
+            // 不转存的话回到列表再右滑就没快照可铺（这正是之前「下层纯色」的根因）。
+            if (backShot != null && backShot != shot) backShot.recycle();
+            backShot = shot;
             // 入场：新页从侧面滑入 + 淡入，盖在静止的旧页快照上（Activity 转场
             // 的样子）。滑入没盖住的部分透出的正是旧页，不存在空帧。
             float travel = getResources().getDisplayMetrics().widthPixels * 0.45f;
@@ -541,8 +558,8 @@ public class MainActivity extends Activity {
                 }
             }));
         } else if (direction < 0) {
-            // 回到上一层：那一层的「上一层」快照我们没拍过，留着只会误导——
-            // 清掉，拖拽返回时改露画布色。
+            // 无动画的返回（animate=false 时没拍快照）：旧快照已对不上新层级，
+            // 清掉，拖拽返回时改露画布色——绝不能留着误导。
             if (backShot != null) {
                 backShot.recycle();
                 backShot = null;
@@ -1903,21 +1920,27 @@ public class MainActivity extends Activity {
         if (currentSessionId.isEmpty()) return;
         editing = true;
         boolean willSend = pendingComposeText != null && !pendingComposeText.isEmpty();
+        boolean willAnswer = pendingAsk != null;
         WatchUi.Page page = ui.page();
         page.navTag = "takeover-on";
         ui.heading(page, "开启接管？", clipLine(currentSessionTitle, 16));
         ui.add(page, ui.text(
-                "开启后可以给这个会话发消息、切换模型。\n\n"
+                "开启后可以给这个会话发消息、切换模型、回答 AI 的问题。\n\n"
                         + "注意：如果手机或网页正开着这个会话，新消息可能不会立刻出现在那边，重启它们即可同步。",
                 12, WatchUi.MUTED), 4, 8);
-        ui.add(page, ui.button(willSend ? "开启并发送" : "开启接管", true, this::enableTakeoverNow), 0, 6);
+        ui.add(page, ui.button(willSend ? "开启并发送" : willAnswer ? "开启并回答" : "开启接管",
+                true, this::enableTakeoverNow), 0, 6);
         ui.add(page, ui.button("取消", false, () -> {
             pendingComposeText = null;
+            pendingAsk = null;
+            pendingChosen = null;
             editing = false;
             renderSession("");
         }), 0, 0);
         page.setOnSwipeRight(() -> {
             pendingComposeText = null;
+            pendingAsk = null;
+            pendingChosen = null;
             editing = false;
             renderSession("");
         });
@@ -1937,7 +1960,14 @@ public class MainActivity extends Activity {
             }
             currentSessionTakeover = true;
             showToast("已开启接管");
-            if (pendingComposeText != null && !pendingComposeText.isEmpty()) {
+            if (pendingAsk != null) {
+                // 是从答题页转过来的：接管完成后自动把刚才选好的答案交上去。
+                Api.Ask ask = pendingAsk;
+                List<List<String>> chosen = pendingChosen;
+                pendingAsk = null;
+                pendingChosen = null;
+                submitAnswers(ask, chosen);
+            } else if (pendingComposeText != null && !pendingComposeText.isEmpty()) {
                 String text = pendingComposeText;
                 pendingComposeText = null;
                 sendMessage(text);
@@ -2081,7 +2111,8 @@ public class MainActivity extends Activity {
                 if (item.action != null) item.action.run();
             }), 0, 6);
         }
-        page.setOnSwipeRight(this::closeMorePage);
+        // 返回用底部边缘下滑（与进入对称，见 dispatchTouchEvent），不用右滑——
+        // 更多页是纵向层，右滑返回是横向层级的约定。
         render(page);
     }
 
@@ -2199,7 +2230,7 @@ public class MainActivity extends Activity {
         final String key = "think:" + step.seq;
         boolean expanded = openRows.contains(key);
         LinearLayout box = ui.card();
-        final TextView head = ui.text(expanded ? "思考 ▾" : "思考 ▸", 12, WatchUi.MUTED);
+        final TextView head = ui.text(expanded ? "思考 ▾" : "思考 ▸", 13, WatchUi.FG);
         head.setPadding(ui.dp(10), ui.dp(8), ui.dp(10), ui.dp(8));
         box.addView(head);
         final View body = ui.bubbleRich(step.thinking, false, step.thinking);
@@ -2268,10 +2299,10 @@ public class MainActivity extends Activity {
         boolean expanded = openGroups.contains(key);
         LinearLayout box = ui.card();
         final TextView head = ui.text((expanded ? "▾ " : "▸ ") + stepLabel(first)
-                + (group.size() > 1 ? " ×" + group.size() : "") + statusMark(first), 12, WatchUi.FG);
+                + (group.size() > 1 ? " ×" + group.size() : "") + statusMark(first), 13, WatchUi.FG);
         head.setPadding(ui.dp(10), ui.dp(8), ui.dp(10), ui.dp(2));
         box.addView(head);
-        final TextView summary = ui.text(clipLine(summaryOf(group), 110), 10, statusColor(first));
+        final TextView summary = ui.text(clipLine(summaryOf(group), 110), 12, statusColor(first));
         summary.setPadding(ui.dp(10), 0, ui.dp(10), ui.dp(6));
         box.addView(summary);
         final LinearLayout list = new LinearLayout(this);
@@ -2282,7 +2313,7 @@ public class MainActivity extends Activity {
             final Api.Step step = group.get(i);
             final String rowKey = key + "#" + i;
             final LinearLayout detail = ui.card();
-            TextView detailText = ui.text(toolDetailText(step), 11, WatchUi.FG);
+            TextView detailText = ui.text(toolDetailText(step), 13, WatchUi.FG);
             detailText.setPadding(ui.dp(10), ui.dp(8), ui.dp(10), ui.dp(8));
             detail.addView(detailText);
             detail.setVisibility(openRows.contains(rowKey) ? View.VISIBLE : View.GONE);
@@ -2889,6 +2920,14 @@ public class MainActivity extends Activity {
      * - 审批/确认（无表单）：选项 id 就是动作 id，回哪个动作服务器就执行哪个。
      */
     private void submitAnswers(final Api.Ask ask, final List<List<String>> chosen) {
+        // 只读会话答不了题：和发消息一样先确认开启接管，选好的答案暂存，
+        // 接管完成后自动继续提交（pendingAsk / pendingChosen）。
+        if (!currentSessionTakeover) {
+            pendingAsk = ask;
+            pendingChosen = chosen;
+            confirmEnableTakeover();
+            return;
+        }
         final String actionId;
         JSONObject input = null;
         if ("input_request".equals(ask.kind)) {

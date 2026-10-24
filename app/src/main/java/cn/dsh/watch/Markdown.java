@@ -86,12 +86,12 @@ final class Markdown {
                 continue;
             }
 
-            // 引用
+            // 引用：▎前缀 + 斜体已足够区分，颜色跟正文一致——灰字容易看不清。
             if (trimmed.startsWith(">")) {
                 String body = trimmed.substring(1).trim();
                 int start = out.length();
                 out.append("▎ ");
-                appendInline(out, body, mutedColor, accentColor, codeBackground);
+                appendInline(out, body, baseColor, accentColor, codeBackground);
                 out.setSpan(new StyleSpan(Typeface.ITALIC), start, out.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                 out.append('\n');
                 continue;
