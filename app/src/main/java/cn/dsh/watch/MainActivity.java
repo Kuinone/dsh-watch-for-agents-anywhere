@@ -151,8 +151,8 @@ public class MainActivity extends Activity {
                 || action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_SCROLL) {
             lastInteractionAt = System.currentTimeMillis();
         }
-        // 操作菜单已打开时不做手势判定，避免与面板内的点击冲突。
-        if (menuOpen || currentPage == null || destroyed) {
+        // 「更多」页打开期间不判定手势，避免与页面内点击冲突。
+        if (editing || currentPage == null || destroyed) {
             return super.dispatchTouchEvent(event);
         }
         float density = getResources().getDisplayMetrics().density;
@@ -165,6 +165,10 @@ public class MainActivity extends Activity {
                 swipeDragging = false;
                 gestureMaxDx = 0f;
                 gestureMaxDy = 0f;
+                // 底部边缘起手（屏高下 12%）才允许触发「上滑开更多」——
+                // 列表中间向上翻页是高频操作，不能抢。
+                edgeSwipe = event.getRawY()
+                        >= getResources().getDisplayMetrics().heightPixels * 0.88f;
                 break;
             }
             case MotionEvent.ACTION_MOVE: {
@@ -206,7 +210,7 @@ public class MainActivity extends Activity {
                     swipeDragging = false;
                     View root = currentPage.root;
                     boolean enough = swipeShift >= triggerPx
-                            || swipeShift >= getResources().getDisplayMetrics().widthPixels * 0.22f;
+                            || swipeShift >= getResources().getDisplayMetrics().widthPixels * 0.5f;
                     if (enough && action == MotionEvent.ACTION_UP) {
                         // 完成转场：从当前位置飞出全屏，然后执行该页定义的右滑动作
                         // （返回上一级 / 双滑退出的提示 / 真正退出）。
@@ -227,11 +231,23 @@ public class MainActivity extends Activity {
                     }
                     return true;
                 }
+                if (action == MotionEvent.ACTION_UP && edgeSwipe
+                        && swipeDownY - event.getRawY() >= triggerPx
+                        && Math.abs(event.getRawX() - swipeDownX) * 1.2f < swipeDownY - event.getRawY()) {
+                    // 底部边缘上滑 → 打开「更多」页（抬手判定，不跟手）。
+                    // 先取消子视图（底栏按钮）的按下态，再换页。
+                    edgeSwipe = false;
+                    MotionEvent cancel = MotionEvent.obtain(event);
+                    cancel.setAction(MotionEvent.ACTION_CANCEL);
+                    super.dispatchTouchEvent(cancel);
+                    cancel.recycle();
+                    showMorePage();
+                    return true;
+                }
                 if (action == MotionEvent.ACTION_UP && Math.abs(gestureMaxDx) >= triggerPx
                         && Math.abs(gestureMaxDx) > gestureMaxDy * 1.2f) {
                     // 抬手兜底：快甩（两帧内就超过阈值）没有中间判定帧，按总位移补判。
                     if (gestureMaxDx > 0) currentPage.fireSwipeRight();
-                    else currentPage.fireSwipeLeft();
                     return true;
                 }
                 break;
@@ -251,16 +267,27 @@ public class MainActivity extends Activity {
     /** 整个手势期间的最大横向/纵向位移（抬手兜底判定用）。 */
     private float gestureMaxDx;
     private float gestureMaxDy;
+    /** 本次手势是否从屏幕底部边缘起手（上滑开「更多」的前提）。 */
+    private boolean edgeSwipe;
     /** 拖拽期间垫在页面底下的画布色底。 */
     private View swipeBackdrop;
     /** 拖拽刚完成转场：下一次 render 不铺旧页快照（旧页已经飞出屏了）。 */
     private boolean swipeTransition;
+    /** 上一层页面的快照：右滑拖拽返回时铺底，露出上一层的样子（最多一张）。 */
+    private Bitmap backShot;
 
-    /** 拖拽期间垫底：页面拖出后露出的是画布色而不是窗口背景。 */
+    /** 拖拽期间垫底：有「上一层」快照时铺它，拖出当前页看到的是上一层的样子。 */
     private void addSwipeBackdrop() {
         if (swipeBackdrop != null) return;
-        View backdrop = new View(this);
-        backdrop.setBackgroundColor(WatchUi.BG);
+        View backdrop;
+        if (backShot != null) {
+            ImageView shotView = new ImageView(this);
+            shotView.setImageBitmap(backShot);
+            backdrop = shotView;
+        } else {
+            backdrop = new View(this);
+            backdrop.setBackgroundColor(WatchUi.BG);
+        }
         ViewGroup content = (ViewGroup) findViewById(android.R.id.content);
         content.addView(backdrop, 0, new ViewGroup.LayoutParams(-1, -1));
         swipeBackdrop = backdrop;
@@ -293,8 +320,6 @@ public class MainActivity extends Activity {
 
     /** 当前页面的手势回调持有者。 */
     private WatchUi.Page currentPage;
-    /** 操作菜单是否打开。 */
-    private boolean menuOpen;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -439,15 +464,6 @@ public class MainActivity extends Activity {
         int direction = pendingNav != 0 ? pendingNav : (navigate ? inferDirection(previousTag, page.navTag) : 0);
         pendingNav = 0;
 
-        // 换页前收掉残留的菜单浮层（不播关闭动画——马上要换页了）。浮层视图
-        // 由下面的替换清理统一移走，这里只复位状态。
-        if (menuOpen) {
-            menuOpen = false;
-            menuBackdrop = null;
-            menuWrapper = null;
-            editing = false;
-        }
-
         WatchUi.Page previous = currentPage;
         currentPage = page;
 
@@ -494,6 +510,12 @@ public class MainActivity extends Activity {
         swipeBackdrop = null;
 
         if (animate && ghost != null) {
+            // 前进：快照转场结束后留着当「上一层」——右滑拖拽返回时铺底露出
+            // 上一层的样子（系统返回手势的体验），而不是一块纯色。
+            if (direction > 0) {
+                if (backShot != null) backShot.recycle();
+                backShot = shot;
+            }
             // 入场：新页从侧面滑入 + 淡入，盖在静止的旧页快照上（Activity 转场
             // 的样子）。滑入没盖住的部分透出的正是旧页，不存在空帧。
             float travel = getResources().getDisplayMetrics().widthPixels * 0.45f;
@@ -507,7 +529,7 @@ public class MainActivity extends Activity {
                     .setInterpolator(new android.view.animation.DecelerateInterpolator(1.8f))
                     .withEndAction(() -> {
                         content.removeView(ghostView);
-                        if (ghostShot != null) ghostShot.recycle();
+                        if (ghostShot != null && ghostShot != backShot) ghostShot.recycle();
                     })
                     .start();
             // 初始下移（ScalingLazyColumn 惯例）：新页面首行从「略过边缘」的位置
@@ -518,12 +540,21 @@ public class MainActivity extends Activity {
                     landing.scroll.scrollTo(0, Math.round(landing.scroll.getHeight() * 0.085f));
                 }
             }));
+        } else if (direction < 0) {
+            // 回到上一层：那一层的「上一层」快照我们没拍过，留着只会误导——
+            // 清掉，拖拽返回时改露画布色。
+            if (backShot != null) {
+                backShot.recycle();
+                backShot = null;
+            }
         }
         if (pendingScrollToBottom) {
             pendingScrollToBottom = false;
-            // 三连 post：等布局完成、且固定底栏的让位 padding（下一帧才补上）
-            // 都生效后再滚，否则最后一屏会被底栏盖住，看起来像「没到底」。
-            page.scroll.post(() -> page.scroll.post(() -> page.scroll.post(page::scrollToBottom)));
+            // 三连 post 跑不赢 vsync：嵌套 post 在同一批消息里就执行完了，
+            // 那时页面还没布局，滚了个寂寞。改成跨帧延迟——100ms 滚一次
+            // （首帧布局必已完成），300ms 再兜底一次（底栏让位 padding 的二次变化）。
+            page.scroll.postDelayed(page::scrollToBottom, 100);
+            page.scroll.postDelayed(page::scrollToBottom, 300);
             return;
         }
         page.scroll.post(() -> page.scroll.scrollTo(0, restore));
@@ -540,7 +571,7 @@ public class MainActivity extends Activity {
      * 优先于此推断，推断不出来的换页一律按前进处理（视觉上仍然平滑）。
      */
     private static final String[] OVERLAY_TAG_PREFIXES =
-            {"compose", "ask", "model", "takeover", "settings", "connect", "new-session"};
+            {"compose", "ask", "model", "takeover", "settings", "connect", "new-session", "more"};
 
     private static int inferDirection(String from, String to) {
         if (from == null || to == null || from.equals(to)) return 0;
@@ -984,6 +1015,7 @@ public class MainActivity extends Activity {
         currentProject = "";
         currentProjectId = "";
         steps.clear();
+        sessionCache.evictAll();
         openGroups.clear();
         openRows.clear();
         lastListSignature = 0;
@@ -1061,7 +1093,7 @@ public class MainActivity extends Activity {
                 springBackCurrentPage();
             }
         });
-        page.setOnSwipeLeft(() -> showActionMenu(menuForProjects()));
+        // 左滑菜单已退役：功能收进「更多」页（底部边缘上滑或底栏「更多」按钮）。
         render(page);
     }
 
@@ -1218,8 +1250,6 @@ public class MainActivity extends Activity {
             store.clearToken();
             showConnect();
         }), 0, 0);
-        // 错误页也要能开菜单（左滑），否则用户被锁在这一页。
-        page.setOnSwipeLeft(() -> showActionMenu(menuForProjects()));
         render(page);
     }
 
@@ -1466,6 +1496,8 @@ public class MainActivity extends Activity {
         currentSessionTakeover = known != null && known.takeover;
         // 「只看对话」默认值来自设置页；进会话时套用一次。
         showAllSteps = !store.onlyConversationDefault();
+        // 首屏只渲染最后 15 条（渲染时间与条数成正比，全量渲染长对话会卡 ANR）。
+        visibleSteps = 15;
         currentAsk = null;
         currentNotices.clear();
         currentRunning = false;
@@ -1474,11 +1506,19 @@ public class MainActivity extends Activity {
         currentHasMore = false;
         steps.clear();
         customAnswers.clear();
+        // 有缓存就先秒开（显示最近一次离开时的内容），快照回来再静默校正。
+        SessionCacheEntry cached = sessionCache.get(sessionId);
+        if (cached != null) {
+            steps.addAll(cached.steps);
+            lastSeq = cached.lastSeq;
+            currentHasMore = cached.hasMore;
+            currentOldestOrderSeq = cached.oldestSeq;
+        }
         store.setLastSession(sessionId, currentSessionTitle);
         autoScrollToBottom = true;
         foregroundSessionId = sessionId;
         refresh.removeCallbacks(sessionTicker);
-        renderSession("正在载入…");
+        renderSession(cached != null ? "" : "正在载入…");
         // 进会话即清未读；结果无所谓。
         api.markRead(sessionId);
         loadSession(sessionId, false);
@@ -1584,13 +1624,33 @@ public class MainActivity extends Activity {
                 else modelDefault = Api.parseModelDefault(catalog);
             }
         }
+
+        // 写会话缓存：下次进入秒开；LRU 最多留 6 个会话。
+        SessionCacheEntry entry = new SessionCacheEntry();
+        entry.steps.addAll(steps);
+        entry.lastSeq = lastSeq;
+        entry.hasMore = currentHasMore;
+        entry.oldestSeq = currentOldestOrderSeq;
+        sessionCache.put(sessionId, entry);
     }
+
+    /** 会话内容缓存条目：steps 与三个游标（进入会话时先秒开，快照回来再校正）。 */
+    private static final class SessionCacheEntry {
+        final List<Api.Step> steps = new ArrayList<>();
+        long lastSeq;
+        boolean hasMore;
+        long oldestSeq;
+    }
+
+    /** 最近看过的会话内容缓存（LRU，6 个会话）。 */
+    private final android.util.LruCache<String, SessionCacheEntry> sessionCache =
+            new android.util.LruCache<>(6);
 
     private static boolean isRunningStatus(String status) {
         return "running".equals(status) || "stopping".equals(status);
     }
 
-    /** 载入失败：登录过期直接回登录页，其余给错误页。 */
+    /** 载入失败：登录过期直接回登录页；已有内容就保持画面，首次才上错误页。 */
     private void handleSessionLoadError(String error, boolean silent) {
         String message = error == null ? "载入失败" : error;
         if (message.contains("重新登录") || message.contains("登录已过期")) {
@@ -1600,6 +1660,11 @@ public class MainActivity extends Activity {
         }
         // 静默刷新失败时保持现有画面：每 4 秒弹一次错误没有意义。
         if (silent) return;
+        // 已经有能看的内容（缓存或上一次快照）就别整屏错误——保持画面 + 轻提示。
+        if (!steps.isEmpty()) {
+            showToast("刷新失败：" + message);
+            return;
+        }
         renderSessionError(message);
     }
 
@@ -1717,6 +1782,9 @@ public class MainActivity extends Activity {
     /** 会话页滚动视图引用（重建时更新），用于「跳到最新」与跟随判断。 */
     private ScrollView sessionScroll;
     /** 进入会话或刚发送消息后跟随到底部一次。 */
+    /** 当前渲染窗口：只渲染 steps 的最后这么多条（本地按钮逐次 +15）。 */
+    private int visibleSteps = 15;
+
     private boolean autoScrollToBottom;
 
     /** 会话页内容指纹：任何会影响渲染的字段变化都要触发重建。 */
@@ -1795,14 +1863,13 @@ public class MainActivity extends Activity {
         // 发消息常驻；运行中给停止（运行时不能切模型），空闲给模型；
         // 其余入口全收进「更多」菜单。
         LinearLayout bottom = ui.bottomBar(page);
-        bottom.addView(weighted(ui.button("发消息", true, this::showCompose)));
+        bottom.addView(weighted(ui.button("\ue163", "发消息", true, this::showCompose)));
         if (currentRunning) {
-            bottom.addView(weighted(ui.button("停止", false, this::cancelRun)));
+            bottom.addView(weighted(ui.button("\ue047", "停止", false, this::cancelRun)));
         } else {
-            bottom.addView(weighted(ui.button("模型", false, this::showModelPicker)));
+            bottom.addView(weighted(ui.button("\ue429", "模型", false, this::showModelPicker)));
         }
-        bottom.addView(weighted(ui.button("更多", false, () -> showActionMenu(menuForSession()))));
-        page.setOnSwipeLeft(() -> showActionMenu(menuForSession()));
+        bottom.addView(weighted(ui.button("\ue5d3", "更多", false, this::showMorePage)));
         page.setOnSwipeRight(this::backToList);
         render(page);
         sessionScroll = page.scroll;
@@ -1919,53 +1986,61 @@ public class MainActivity extends Activity {
         final String label;
         final String subtitle;
         final Runnable action;
+        /** Material Icons 码点（如 "\ue163"），可空。 */
+        final String icon;
 
         MenuItem(String label, String subtitle, Runnable action) {
+            this(label, null, subtitle, action);
+        }
+
+        MenuItem(String icon, String label, String subtitle, Runnable action) {
             this.label = label;
             this.subtitle = subtitle == null ? "" : subtitle;
             this.action = action;
+            this.icon = icon;
         }
     }
 
     private List<MenuItem> menuForSession() {
         List<MenuItem> items = new ArrayList<>();
-        items.add(new MenuItem("发消息", "给这个会话发一条新消息", this::showCompose));
+        items.add(new MenuItem("\ue163", "发消息", "给这个会话发一条新消息", this::showCompose));
         if (currentAsk != null) {
-            items.add(new MenuItem("回答问题", "AI 正在等你回答", () -> showQuestion(currentAsk)));
+            items.add(new MenuItem("\ue887", "回答问题", "AI 正在等你回答", () -> showQuestion(currentAsk)));
         }
         if (currentRunning) {
-            items.add(new MenuItem("停止生成", "打断当前回复", this::cancelRun));
+            items.add(new MenuItem("\ue047", "停止生成", "打断当前回复", this::cancelRun));
         }
-        items.add(new MenuItem(currentSessionTakeover ? "关闭接管" : "开启接管",
+        items.add(new MenuItem("\ue8b8", currentSessionTakeover ? "关闭接管" : "开启接管",
                 currentSessionTakeover ? "会话回到只读，不能再发消息" : "允许发消息与切换模型",
                 currentSessionTakeover ? this::confirmDisableTakeover : this::confirmEnableTakeover));
-        items.add(new MenuItem(showAllSteps ? "只看对话" : "显示全部步骤",
+        items.add(new MenuItem(showAllSteps ? "\ue8f4" : "\ue8f5",
+                showAllSteps ? "只看对话" : "显示全部步骤",
                 showAllSteps ? "隐藏工具与思考卡片" : "恢复工具与思考卡片", () -> {
             showAllSteps = !showAllSteps;
             lastContentSignature = 0;
             fillContent();
         }));
-        items.add(new MenuItem("刷新", "重新拉取会话", () -> loadSession(currentSessionId, false)));
-        items.add(new MenuItem("模型", "当前：" + currentModelLabel(), this::showModelPicker));
+        items.add(new MenuItem("\ue5d5", "刷新", "重新拉取会话", () -> loadSession(currentSessionId, false)));
+        items.add(new MenuItem("\ue429", "模型", "当前：" + currentModelLabel(), this::showModelPicker));
         if (currentHasMore) {
-            items.add(new MenuItem("看更早的内容", "向上翻历史", this::loadOlder));
+            items.add(new MenuItem("\ue889", "看更早的内容", "向上翻历史", this::loadOlder));
         }
-        items.add(new MenuItem("跳到最新", "回到会话底部", () -> {
+        items.add(new MenuItem("\ue5cf", "跳到最新", "回到会话底部", () -> {
             if (sessionScroll != null) {
                 sessionScroll.post(() -> sessionScroll.fullScroll(View.FOCUS_DOWN));
             }
         }));
-        items.add(new MenuItem("界面设置", "字号 · 刷新频率", this::showSettings));
-        items.add(new MenuItem("账号与服务器", store.email(), this::showConnect));
-        items.add(new MenuItem("返回项目", "", this::backToList));
+        items.add(new MenuItem("\ue8b8", "界面设置", "字号 · 刷新频率", this::showSettings));
+        items.add(new MenuItem("\ue7fd", "账号与服务器", store.email(), this::showConnect));
+        items.add(new MenuItem("\ue5c4", "返回项目", "", this::backToList));
         return items;
     }
 
     private List<MenuItem> menuForProjects() {
         List<MenuItem> items = new ArrayList<>();
-        items.add(new MenuItem("新建会话", "选一个项目开始", this::createSession));
+        items.add(new MenuItem("\ue145", "新建会话", "选一个项目开始", this::createSession));
         if (!ALL_SESSIONS.equals(currentProjectId)) {
-            items.add(new MenuItem("全部会话", "不按项目分组", () -> {
+            items.add(new MenuItem("\ue896", "全部会话", "不按项目分组", () -> {
                 currentProject = "全部";
                 currentProjectId = ALL_SESSIONS;
                 resetScroll();
@@ -1973,89 +2048,57 @@ public class MainActivity extends Activity {
             }));
         }
         if (!currentProjectId.isEmpty()) {
-            items.add(new MenuItem("返回项目", "", () -> {
+            items.add(new MenuItem("\ue5c4", "返回项目", "", () -> {
                 currentProject = "";
                 currentProjectId = "";
                 resetScroll();
                 showSessionList();
             }));
         }
-        items.add(new MenuItem("刷新", "重新拉取列表", this::showSessionList));
-        items.add(new MenuItem("界面设置", "字号 · 刷新频率", this::showSettings));
-        items.add(new MenuItem("账号与服务器", store.email(), this::showConnect));
-        items.add(new MenuItem("退出登录", "清除令牌，重新登录", this::disconnect));
+        items.add(new MenuItem("\ue5d5", "刷新", "重新拉取列表", this::showSessionList));
+        items.add(new MenuItem("\ue8b8", "界面设置", "字号 · 刷新频率", this::showSettings));
+        items.add(new MenuItem("\ue7fd", "账号与服务器", store.email(), this::showConnect));
+        items.add(new MenuItem("\ue9ba", "退出登录", "清除令牌，重新登录", this::disconnect));
         return items;
     }
 
-    private View menuBackdrop;
-    private ScrollView menuWrapper;
-
     /**
-     * 右侧滑出的操作菜单。
+     * 「更多」页：原左滑菜单的全部功能收进一个整页。
      *
-     * 面板贴右边缘、从右滑入——左滑手势是「把右侧的内容拉出来」，方向必须一致。
-     * 菜单打开期间 editing = true：4 秒一次的会话刷新会重建整屏，把菜单连根拔掉。
+     * 入口统一为底部边缘上滑（或底栏「更多」按钮）。打开期间 editing = true：
+     * 4 秒一次的会话刷新会重建整屏，把这一页连根拔掉。
      */
-    private void showActionMenu(List<MenuItem> items) {
-        if (menuOpen || currentPage == null) return;
-        menuOpen = true;
+    private void showMorePage() {
+        if (currentPage == null || destroyed) return;
+        List<MenuItem> items = menuForMore();
         editing = true;
-        android.view.ViewGroup root = (android.view.ViewGroup) findViewById(android.R.id.content);
-
-        menuBackdrop = new View(this);
-        menuBackdrop.setBackgroundColor(0x99000000);
-        menuBackdrop.setOnClickListener(v -> dismissMenu());
-        root.addView(menuBackdrop, new FrameLayout.LayoutParams(-1, -1));
-
-        LinearLayout panelContent = new LinearLayout(this);
-        panelContent.setOrientation(LinearLayout.VERTICAL);
-        panelContent.setBackground(ui.surface(WatchUi.SURFACE, 18));
-
-        TextView title = ui.text("操作", 14, WatchUi.FG);
-        title.setPadding(ui.dp(14), ui.dp(12), ui.dp(14), ui.dp(6));
-        panelContent.addView(title);
-        panelContent.addView(ui.dividerView());
+        WatchUi.Page page = ui.page();
+        page.navTag = "more";
+        ui.heading(page, "更多", currentSessionId.isEmpty() ? "应用功能" : clipLine(currentSessionTitle, 16));
         for (final MenuItem item : items) {
-            View row = ui.row(item.label, item.subtitle, () -> {
-                dismissMenu();
+            ui.add(page, ui.row(item.icon, item.label, item.subtitle, () -> {
+                editing = false;
                 if (item.action != null) item.action.run();
-            });
-            panelContent.addView(row);
+            }), 0, 6);
         }
-
-        // 菜单项多于屏幕时面板本体也要能滚，所以内容包进 ScrollView。
-        int width = (int) (getResources().getDisplayMetrics().widthPixels * 0.82f);
-        menuWrapper = new ScrollView(this);
-        menuWrapper.addView(panelContent, new FrameLayout.LayoutParams(-1, -2));
-        FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(width, -1);
-        panelParams.gravity = Gravity.END;
-        root.addView(menuWrapper, panelParams);
-
-        // 入场：从右滑入 + 淡入。
-        menuWrapper.setTranslationX(width);
-        menuWrapper.setAlpha(0f);
-        menuWrapper.animate().translationX(0f).alpha(1f).setDuration(140).start();
-        menuBackdrop.setAlpha(0f);
-        menuBackdrop.animate().alpha(1f).setDuration(140).start();
+        page.setOnSwipeRight(this::closeMorePage);
+        render(page);
     }
 
-    /** 关闭操作菜单（150ms 反向动画，动画结束才移除视图）。 */
-    private void dismissMenu() {
-        if (!menuOpen) return;
-        menuOpen = false;
+    /** 按「当前在会话页还是列表页」取对应的菜单条目。 */
+    private List<MenuItem> menuForMore() {
+        return onSessionPage && !currentSessionId.isEmpty()
+                ? menuForSession() : menuForProjects();
+    }
+
+    /** 关闭「更多」页：回到来源页（会话或列表）。 */
+    private void closeMorePage() {
         editing = false;
-        final android.view.ViewGroup root = (android.view.ViewGroup) findViewById(android.R.id.content);
-        final View backdrop = menuBackdrop;
-        final View panel = menuWrapper;
-        menuBackdrop = null;
-        menuWrapper = null;
-        if (backdrop == null || panel == null) return;
-        backdrop.animate().alpha(0f).setDuration(150).start();
-        panel.animate().translationX(panel.getWidth() == 0 ? ui.dp(200) : panel.getWidth())
-                .alpha(0f).setDuration(150).withEndAction(() -> {
-            if (backdrop.getParent() == root) root.removeView(backdrop);
-            if (panel.getParent() == root) root.removeView(panel);
-        }).start();
+        if (onSessionPage && !currentSessionId.isEmpty()) {
+            renderSession("");
+        } else {
+            renderSessionListPage();
+        }
     }
 
     // ------------------------------------------------------------ 内容渲染
@@ -2078,7 +2121,7 @@ public class MainActivity extends Activity {
             debugLog("渲染步骤失败: " + error);
             ui.addTo(contentArea, ui.text("这一段内容渲染失败，可在菜单里换「只看对话」试试。", 12, WatchUi.WARN), 0, 8);
         }
-        if (showAllSteps && currentHasMore) {
+        if (showAllSteps && currentHasMore && steps.size() <= visibleSteps) {
             ui.addTo(contentArea, ui.button("载入更早的内容", false, this::loadOlder), 0, 8);
         }
         if (autoScrollToBottom) {
@@ -2110,9 +2153,21 @@ public class MainActivity extends Activity {
      * 否则每 4 秒一次的刷新会让所有卡片闪一遍）。
      */
     private void renderSteps(LinearLayout container) {
+        // 首屏只渲染最后 visibleSteps 条：渲染时间与条数成正比，全量渲染长对话
+        // 会卡到 ANR。截掉的部分用本地按钮展开（不发请求）。
+        List<Api.Step> visible = steps;
+        int hidden = 0;
+        if (steps.size() > visibleSteps) {
+            hidden = steps.size() - visibleSteps;
+            visible = steps.subList(hidden, steps.size());
+        }
+        if (hidden > 0) {
+            ui.addTo(container, ui.button("\ue889 显示更早的内容（还有 " + hidden + " 条）",
+                    false, this::showEarlierSteps), 0, 8);
+        }
         List<Block> blocks = new ArrayList<>();
         Block current = null;
-        for (Api.Step step : steps) {
+        for (Api.Step step : visible) {
             boolean isTool = "tool".equals(step.kind);
             if (current != null && isTool && current.toolGroup) {
                 current.steps.add(step);
@@ -2346,16 +2401,33 @@ public class MainActivity extends Activity {
 
     /** 只看对话模式：仅渲染 message 步骤（与完整模式同一渲染路径）。 */
     private void renderMessagesOnly(LinearLayout container) {
-        int shown = 0;
+        // 只看对话也裁剪：先收集全部消息步骤，再只渲染最后 visibleSteps 条。
+        List<Api.Step> messages = new ArrayList<>();
         for (Api.Step step : steps) {
             if (!"message".equals(step.kind)) continue;
             if (step.text == null || step.text.trim().isEmpty()) continue;
-            messageBubble(container, step);
+            messages.add(step);
+        }
+        int hidden = Math.max(0, messages.size() - visibleSteps);
+        if (hidden > 0) {
+            ui.addTo(container, ui.button("\ue889 显示更早的对话（还有 " + hidden + " 条）",
+                    false, this::showEarlierSteps), 0, 8);
+        }
+        int shown = 0;
+        for (int i = hidden; i < messages.size(); i++) {
+            messageBubble(container, messages.get(i));
             shown++;
         }
         if (shown == 0) {
             ui.addTo(container, ui.text("还没有对话内容", 12, WatchUi.MUTED), 0, 10);
         }
+    }
+
+    /** 本地展开更早的内容（不发请求，渲染窗口扩大 15 条）。 */
+    private void showEarlierSteps() {
+        visibleSteps += 15;
+        lastContentSignature = 0;
+        fillContent();
     }
 
     /** 向上翻一页历史（orderSeq 序列域：最早一条再往前 1）。 */
@@ -2380,6 +2452,9 @@ public class MainActivity extends Activity {
             List<Api.Step> merged = Api.mergeSteps(steps, older);
             steps.clear();
             steps.addAll(merged);
+            // 用户刚点了「载入更早」想看历史：渲染窗口直接扩到覆盖全部已载内容，
+            // 否则新拉下来的历史会被「显示更早」按钮藏住。
+            visibleSteps = Math.max(visibleSteps, steps.size());
             currentHasMore = result.value.optBoolean("hasMore", false);
             if (!steps.isEmpty()) currentOldestOrderSeq = steps.get(0).seq;
             if (steps.size() == beforeCount) {
@@ -2914,10 +2989,6 @@ public class MainActivity extends Activity {
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         if (keyCode == KeyEvent.KEYCODE_BACK) {
-            if (menuOpen) {
-                dismissMenu();
-                return true;
-            }
             if (editing) {
                 // 输入页 / 答题页 / 模型页：返回上一层，而不是退出应用。
                 editing = false;

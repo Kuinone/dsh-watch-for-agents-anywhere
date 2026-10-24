@@ -423,7 +423,13 @@ final class WatchUi {
      * 次按钮是深灰面板 + 白字的胶囊（secondaryAction）。
      */
     TextView button(String label, boolean primary, Runnable action) {
-        TextView button = text(label, 14, primary ? ON_ACCENT : FG);
+        return button(null, label, primary, action);
+    }
+
+    /** 带图标版按钮：icon 为 Material Icons 码点（可空）。 */
+    TextView button(String icon, String label, boolean primary, Runnable action) {
+        TextView button = text(withIcon(icon, label, primary ? Typeface.BOLD : Typeface.NORMAL),
+                14, primary ? ON_ACCENT : FG);
         button.setTypeface(Typeface.DEFAULT, primary ? Typeface.BOLD : Typeface.NORMAL);
         button.setGravity(Gravity.CENTER);
         button.setMaxLines(1);
@@ -449,6 +455,62 @@ final class WatchUi {
         shape.setCornerRadius(dp(24));
         shape.setStroke(Math.max(1, dp(0.8f)), STROKE);
         return new RippleDrawable(ColorStateList.valueOf(RIPPLE), shape, null);
+    }
+
+    /** Material Icons 字体（assets/fonts/MaterialIcons-Regular.ttf），懒加载。 */
+    private android.graphics.Typeface materialFont;
+
+    private android.graphics.Typeface materialFont() {
+        if (materialFont == null) {
+            try {
+                materialFont = android.graphics.Typeface.createFromAsset(
+                        activity.getAssets(), "fonts/MaterialIcons-Regular.ttf");
+            } catch (Throwable error) {
+                materialFont = android.graphics.Typeface.DEFAULT;
+            }
+        }
+        return materialFont;
+    }
+
+    /** 只把第一个字符（图标码点）换成 Material Icons 字体的 span。 */
+    private static final class IconTypefaceSpan extends android.text.style.MetricAffectingSpan {
+        private final android.graphics.Typeface face;
+
+        IconTypefaceSpan(android.graphics.Typeface face) {
+            this.face = face;
+        }
+
+        @Override
+        public void updateMeasureState(android.text.TextPaint paint) {
+            paint.setTypeface(face);
+        }
+
+        @Override
+        public void updateDrawState(android.text.TextPaint paint) {
+            paint.setTypeface(face);
+        }
+    }
+
+    /**
+     * 「图标 + 文字」：icon 是 Material Icons 码点（如 "\ue163" = send）。
+     * 图标段换成 Material 字体、文字段恢复系统字体（保留加粗样式）——
+     * 否则字体 span 会泄漏到后面的所有字符，整行变豆腐块。
+     */
+    CharSequence withIcon(String icon, CharSequence label, int labelStyle) {
+        if (icon == null || icon.isEmpty()) return label;
+        android.text.SpannableString span =
+                new android.text.SpannableString(icon + "  " + label);
+        span.setSpan(new IconTypefaceSpan(materialFont()), 0, 1,
+                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        span.setSpan(new IconTypefaceSpan(
+                        android.graphics.Typeface.create(Typeface.DEFAULT, labelStyle)),
+                1, span.length(), android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        return span;
+    }
+
+    /** 可点击的行（带 Material 图标）：委托给通用 row，标题拼图标（标题加粗）。 */
+    View row(String icon, CharSequence title, String subtitle, Runnable action) {
+        return row(withIcon(icon, title, Typeface.BOLD), subtitle, action);
     }
 
     /** 可点击的行：标题 + 可选副标题，整行高度不低于 48dp。 */

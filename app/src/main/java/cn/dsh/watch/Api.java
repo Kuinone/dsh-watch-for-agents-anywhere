@@ -498,8 +498,9 @@ final class Api {
     }
 
     /** 会话快照：会话信息 + 运行状态 + 最近时间线 + 通知 + 模型目录，一次全拿。 */
+    /** 首屏快照只取最近 30 条：响应小、快、不易超时；更早的走「载入更早」按钮。 */
     void snapshot(String sessionId, Callback callback) {
-        request("GET", "/sessions/" + urlEncode(sessionId) + "/snapshot?limit=100", null, true, callback);
+        request("GET", "/sessions/" + urlEncode(sessionId) + "/snapshot?limit=30", null, true, callback);
     }
 
     /** 时间线增量：只要 afterSeq 之后变化的条目。 */
